@@ -1,4 +1,5 @@
 use storage_engine::{ApexEngine, SyncPolicy};
+use futures_util::StreamExt;
 use bytes::Bytes;
 use tempfile::tempdir;
 use std::time::Duration;
@@ -12,7 +13,7 @@ async fn test_compaction_shrink() {
     for i in 0..5 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
         engine.force_flush().unwrap();
     }
 
@@ -55,7 +56,7 @@ async fn test_ghost_read_concurrency() {
     for i in 0..100 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
     }
     engine.force_flush().unwrap();
 
@@ -65,7 +66,8 @@ async fn test_ghost_read_concurrency() {
     let reader_handle = tokio::spawn(async move {
         let mut scan = engine_cloned.scan(Bytes::from("key_000"), Bytes::from("key_099")).unwrap();
         let mut count = 0;
-        while let Some((_k, _v)) = scan.next().unwrap() {
+        while let Some(res) = scan.next().await {
+            let _ = res.unwrap();
             count += 1;
             // Artificial delay to simulate long-running scan
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -77,7 +79,7 @@ async fn test_ghost_read_concurrency() {
     for i in 100..200 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
         if i % 10 == 0 {
             engine.force_flush().unwrap();
         }
@@ -95,16 +97,16 @@ async fn test_tombstone_purge() {
     let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).unwrap();
 
     // 1. Insert a key
-    engine.put(Bytes::from("key_to_delete"), Bytes::from("value")).unwrap();
+    engine.put(Bytes::from("key_to_delete"), Bytes::from("value")).await.unwrap();
     engine.force_flush().unwrap();
 
     // 2. Delete the key
-    engine.delete(Bytes::from("key_to_delete")).unwrap();
+    engine.delete(Bytes::from("key_to_delete")).await.unwrap();
     engine.force_flush().unwrap();
 
     // 3. Trigger more flushes to ensure compaction triggers
     for i in 0..10 {
-        engine.put(Bytes::from(format!("other_{}", i)), Bytes::from("val")).unwrap();
+        engine.put(Bytes::from(format!("other_{}", i)), Bytes::from("val")).await.unwrap();
         engine.force_flush().unwrap();
     }
 
@@ -116,5 +118,5 @@ async fn test_tombstone_purge() {
 
     // 6. Scan should not show it either
     let mut scan = engine.scan(Bytes::from("key_"), Bytes::from("key_z")).unwrap();
-    assert!(scan.next().unwrap().is_none());
+    assert!(scan.next().await.is_none());
 }

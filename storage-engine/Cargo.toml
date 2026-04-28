@@ -13,6 +13,7 @@ thiserror = "1.0.57"
 parking_lot = "0.12.1"
 moka = { version = "0.12.5", features = ["sync"] }
 arc-swap = "1.9.1"
+futures-util = "0.3.32"
 
 [dev-dependencies]
 proptest = "1.4.0"

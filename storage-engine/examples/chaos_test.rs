@@ -26,19 +26,20 @@ use storage_engine::engine::ApexEngine;
 const DATA_DIR: &str = "/tmp/apexdb_chaos";
 const NUM_KEYS: usize = 1_000;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let recover_mode = args.iter().any(|a| a == "--recover");
 
     if recover_mode {
-        run_recover();
+        run_recover().await;
     } else {
-        run_write();
+        run_write().await;
     }
 }
 
 /// Phase A: Write 1,000 keys, then block forever waiting to be killed.
-fn run_write() {
+async fn run_write() {
     println!("=== ApexDB Chaos Test ===");
     println!("Data dir: {DATA_DIR}");
     println!("Writing {NUM_KEYS} keys with SyncPolicy::EveryWrite...\n");
@@ -51,7 +52,7 @@ fn run_write() {
     for i in 0..NUM_KEYS {
         let key = Bytes::from(format!("key-{i:05}"));
         let value = Bytes::from(format!("value-{i:05}-payload-{}", "X".repeat(64)));
-        engine.put(key, value).unwrap_or_else(|e| {
+        engine.put(key, value).await.unwrap_or_else(|e| {
             eprintln!("Write failed at key {i}: {e}");
             process::exit(1);
         });
@@ -64,13 +65,13 @@ fn run_write() {
     println!("\n✅ All {NUM_KEYS} keys written and fsynced to WAL.");
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  READY TO CRASH                                        ║");
-    println!("║                                                        ║");
-    println!("║  Hit Ctrl+C, or from another terminal:                 ║");
-    println!("║    kill -9 $(pgrep chaos_test)                         ║");
-    println!("║                                                        ║");
-    println!("║  Then run:                                              ║");
-    println!("║    cargo run --example chaos_test -- --recover          ║");
+    println!("║  READY TO CRASH                                          ║");
+    println!("║                                                          ║");
+    println!("║  Hit Ctrl+C, or from another terminal:                   ║");
+    println!("║    kill -9 $(pgrep chaos_test)                           ║");
+    println!("║                                                          ║");
+    println!("║  Then run:                                               ║");
+    println!("║    cargo run --example chaos_test -- --recover           ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
     // Block forever — the only way out is a signal.
@@ -80,7 +81,7 @@ fn run_write() {
 }
 
 /// Phase B: Reopen the engine and verify every key survived the crash.
-fn run_recover() {
+async fn run_recover() {
     println!("=== ApexDB Recovery Verification ===");
     println!("Data dir: {DATA_DIR}");
     println!("Opening engine (WAL replay will happen automatically)...\n");
