@@ -135,31 +135,9 @@ impl SSTableReader {
             Err(idx) => idx - 1,
         };
 
-        let block_offset = self.sparse_index[block_idx].1;
 
-        // Determine size of the block to read
-        let next_offset = if block_idx + 1 < self.sparse_index.len() {
-            self.sparse_index[block_idx + 1].1
-        } else {
-            self.index_offset
-        };
-
-        // 3. Block Cache lookup — thread-safe, no file mutex needed
-        let cache_key = (self.id, block_offset);
-        let block = if let Some(b) = self.block_cache.get(&cache_key) {
-            b
-        } else {
-            // Cache miss: lock-free read from disk using pread
-            let size = (next_offset - block_offset) as usize;
-            let mut block_data = vec![0u8; size];
-            self.table_cache.get_file(self.id)?.read_exact_at(&mut block_data, block_offset)?;
- 
-            let b = Arc::new(Block {
-                data: Bytes::from(block_data),
-            });
-            self.block_cache.insert(cache_key, Arc::clone(&b));
-            b
-        };
+        // 3. Block Cache lookup & verification
+        let block = self.get_block(block_idx)?;
 
         Ok(Self::search_block(&block, key))
     }
@@ -177,20 +155,44 @@ impl SSTableReader {
             self.index_offset
         };
 
+        self.read_and_verify_block(block_offset, next_offset)
+    }
+
+    fn read_and_verify_block(&self, block_offset: u64, next_block_offset: u64) -> Result<Arc<Block>> {
         let cache_key = (self.id, block_offset);
         if let Some(b) = self.block_cache.get(&cache_key) {
-            Ok(b)
-        } else {
-            let size = (next_offset - block_offset) as usize;
-            let mut block_data = vec![0u8; size];
-            self.table_cache.get_file(self.id)?.read_exact_at(&mut block_data, block_offset)?;
-
-            let b = Arc::new(Block {
-                data: Bytes::from(block_data),
-            });
-            self.block_cache.insert(cache_key, Arc::clone(&b));
-            Ok(b)
+            return Ok(b);
         }
+
+        // The block on disk is [data][checksum(4)]
+        let full_size = (next_block_offset - block_offset) as usize;
+        if full_size < 4 {
+            return Err(ApexError::Corruption(format!(
+                "Invalid block size {} in SSTable {}",
+                full_size, self.id
+            )));
+        }
+
+        let mut buf = vec![0u8; full_size];
+        let file = self.table_cache.get_file(self.id)?;
+        file.read_exact_at(&mut buf, block_offset)?;
+
+        let (data, checksum_bytes) = buf.split_at(full_size - 4);
+        let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().unwrap());
+        let actual_checksum = crc32fast::hash(data);
+
+        if actual_checksum != expected_checksum {
+            return Err(ApexError::Corruption(format!(
+                "Checksum mismatch for SSTable {} at offset {}. Data may be corrupted.",
+                self.id, block_offset
+            )));
+        }
+
+        let b = Arc::new(Block {
+            data: Bytes::copy_from_slice(data),
+        });
+        self.block_cache.insert(cache_key, Arc::clone(&b));
+        Ok(b)
     }
 
     /// Linear scan within a single data block for the target key.

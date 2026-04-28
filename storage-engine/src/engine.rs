@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use crate::iterator::{DbIterator, MemTableIterator, MergingIterator, ScanStream};
 use crate::sstable::iterator::SSTableIterator;
+use crate::batch::{WriteBatch, BatchOp};
+use tracing::{info, error};
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -243,6 +245,12 @@ impl ApexEngine {
         }
     }
 
+    /// Returns true if the engine is overwhelmed with pending flushes.
+    /// Used for network backpressure to slow down producers.
+    pub fn is_saturated(&self) -> bool {
+        self.immutable_memtables.len() >= 5
+    }
+
     // -----------------------------------------------------------------------
     // Background Sync Worker (for SyncPolicy::Delayed)
     // -----------------------------------------------------------------------
@@ -290,27 +298,43 @@ impl ApexEngine {
     // -----------------------------------------------------------------------
 
     pub async fn put(&self, key: Bytes, value: Bytes) -> Result<()> {
-        self.metrics.record_put();
-        self.write_internal(key, EntryValue::Value(value)).await
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write_batch(batch).await
     }
 
     pub async fn delete(&self, key: Bytes) -> Result<()> {
-        self.write_internal(key, EntryValue::Tombstone).await
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write_batch(batch).await
     }
 
-    /// Core write path.
-    ///
-    /// 1. Acquire WAL mutex → append + optional fsync  (disk I/O, no version lock)
-    /// 2. Acquire version read-lock → insert into memtable (nanoseconds, in-memory)
-    /// 3. If memtable is full → rotate (still under version lock, but fast)
-    async fn write_internal(&self, key: Bytes, value: EntryValue) -> Result<()> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+    /// Applies a batch of operations atomically.
+    pub async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
 
-        let bytes_written;
         // --- Phase 1: WAL append (under Mutex) ---
+        let start_lsn;
+        let bytes_written;
         {
             let mut wal = self.wal.lock();
-            bytes_written = wal.append(lsn, &key, &value)?;
+            start_lsn = self.next_lsn.fetch_add(batch.len() as u64, Ordering::SeqCst);
+            
+            let mut total_bytes = 0;
+            for (i, op) in batch.ops.iter().enumerate() {
+                let lsn = start_lsn + i as u64;
+                match op {
+                    BatchOp::Put(k, v) => {
+                        total_bytes += wal.append(lsn, k, &EntryValue::Value(v.clone()))?;
+                    }
+                    BatchOp::Delete(k) => {
+                        total_bytes += wal.append(lsn, k, &EntryValue::Tombstone)?;
+                    }
+                }
+            }
+            bytes_written = total_bytes;
 
             match self.sync_policy {
                 SyncPolicy::EveryWrite => {
@@ -322,7 +346,7 @@ impl ApexEngine {
                 }
                 SyncPolicy::Buffered => {}
             }
-        } // WAL mutex released
+        }
 
         self.metrics.record_wal_write(bytes_written);
 
@@ -331,20 +355,28 @@ impl ApexEngine {
             self.sync_notifier.notified().await;
         }
 
-        // --- Phase 2: MemTable insert (lock-free) ---
-        let needs_flush;
-        {
-            let version = self.version_set.load();
-            version.active_memtable.put(key, value, lsn);
-            needs_flush = version.active_memtable.size() >= MEMTABLE_SIZE_LIMIT;
-        } // version guard released
+        // --- Phase 2: MemTable insertion ---
+        let version = self.version_set.load();
+        for (i, op) in batch.ops.iter().enumerate() {
+            let lsn = start_lsn + i as u64;
+            match op {
+                BatchOp::Put(k, v) => {
+                    version.active_memtable.put(k.clone(), EntryValue::Value(v.clone()), lsn);
+                }
+                BatchOp::Delete(k) => {
+                    version.active_memtable.put(k.clone(), EntryValue::Tombstone, lsn);
+                }
+            }
+        }
 
-        if needs_flush {
+        // --- Phase 3: Flush trigger ---
+        if version.active_memtable.size() > MEMTABLE_SIZE_LIMIT {
             self.trigger_flush()?;
         }
 
         Ok(())
     }
+
 
     /// Explicitly flush the WAL buffer to disk.
     ///
@@ -414,7 +446,9 @@ impl ApexEngine {
                 version_arc,
                 manifest_arc,
             ) {
-                eprintln!("Background flush failed: {e:?}");
+                error!("Background flush failed for SSTable {}: {:?}", sst_id, e);
+            } else {
+                info!("Successfully flushed SSTable {}", sst_id);
             }
         });
 

@@ -27,7 +27,10 @@ pub mod sstable;
 pub mod wal;
 pub mod iterator;
 pub mod compaction;
+pub mod network;
+pub mod batch;
 
 pub use engine::{ApexEngine, SyncPolicy};
+pub use batch::WriteBatch;
 pub use error::{ApexError, Result};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
