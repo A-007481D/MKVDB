@@ -97,7 +97,7 @@ impl MemTable {
     }
 
     /// Returns an iterator over the entries in the memtable.
-    pub fn iter(&self) -> crossbeam_skiplist::map::Iter<Bytes, EntryValue> {
+    pub fn iter(&self) -> crossbeam_skiplist::map::Iter<'_, Bytes, EntryValue> {
         self.map.iter()
     }
 }
