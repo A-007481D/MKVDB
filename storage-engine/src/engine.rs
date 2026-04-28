@@ -77,7 +77,7 @@ pub struct ApexEngine {
     pub(crate) manifest: Arc<Mutex<Manifest>>,
     pub(crate) wal: Arc<Mutex<WalWriter>>,
     pub(crate) immutable_memtables: Arc<ImmutableMemTables>,
-    pub(crate) block_cache: Cache<u64, Arc<Block>>,
+    pub(crate) block_cache: Cache<(u64, u64), Arc<Block>>,
     /// Monotonically increasing sequence number. Atomic so the WAL append
     /// (under Mutex) and the memtable insert can share the value without
     /// needing the VersionSet lock.
@@ -106,7 +106,7 @@ impl ApexEngine {
         let manifest_path = data_dir.join("MANIFEST");
         let mut manifest = Manifest::open(&manifest_path)?;
 
-        let block_cache: Cache<u64, Arc<Block>> = Cache::new(1024 * 1024 * 1024 / 4096);
+        let block_cache: Cache<(u64, u64), Arc<Block>> = Cache::new(1024 * 1024 * 1024 / 4096);
         let immutable_memtables = Arc::new(ImmutableMemTables::new());
 
         // ---- Recover SSTables listed in the MANIFEST ----
@@ -401,7 +401,7 @@ impl ApexEngine {
         sst_id: u64,
         wal_id: u64,
         memtable: Arc<MemTable>,
-        block_cache: Cache<u64, Arc<Block>>,
+        block_cache: Cache<(u64, u64), Arc<Block>>,
         immutable_queue: Arc<ImmutableMemTables>,
         version_arc: Arc<ArcSwap<Version>>,
         manifest_arc: Arc<Mutex<Manifest>>,
@@ -528,6 +528,12 @@ impl ApexEngine {
             iter: merging_iter,
             end_key,
         })
+    }
+
+    /// Manually triggers a flush of the current memtable to an SSTable on disk.
+    /// Useful for testing and controlled persistence.
+    pub fn force_flush(&self) -> Result<()> {
+        self.trigger_flush()
     }
 }
 

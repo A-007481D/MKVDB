@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use storage_engine::engine::ApexEngine;
 use tempfile::tempdir;
 
-#[test]
-fn test_basic_put_get_delete() {
+#[tokio::test]
+async fn test_basic_put_get_delete() {
     let dir = tempdir().unwrap();
     let engine = ApexEngine::open(dir.path()).unwrap();
 
@@ -27,8 +27,8 @@ fn test_basic_put_get_delete() {
     assert_eq!(result2, None);
 }
 
-#[test]
-fn test_crash_recovery_via_wal_replay() {
+#[tokio::test]
+async fn test_crash_recovery_via_wal_replay() {
     let dir = tempdir().unwrap();
 
     let key1 = Bytes::from("k1");
@@ -57,8 +57,8 @@ fn test_crash_recovery_via_wal_replay() {
     }
 }
 
-#[test]
-fn test_overwrite_survives_recovery() {
+#[tokio::test]
+async fn test_overwrite_survives_recovery() {
     let dir = tempdir().unwrap();
     let key = Bytes::from("counter");
 

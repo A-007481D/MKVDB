@@ -169,8 +169,6 @@ impl MergingIterator {
             self.current_idx = Some(top.iter_idx);
             
             // CONFLICT RESOLUTION:
-            // Since we popped a key, we must discard any other iterators in the heap
-            // that have the exact same key (which will have lower LSNs due to heap ordering).
             while let Some(peek) = self.heap.peek() {
                 if peek.key == top.key {
                     // It's a duplicate key! Pop it, advance its iterator, and re-push.
@@ -215,3 +213,4 @@ impl DbIterator for MergingIterator {
         self.current_idx.is_some()
     }
 }
+
