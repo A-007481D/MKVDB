@@ -78,7 +78,7 @@ jobs:
         echo "- High-Performance WAL with SyncPolicy::Delayed (Group Commit)" >> RELEASE_NOTES.md
         echo "- Concurrent Read Path (Non-blocking reads via Mutex-wrapped files)" >> RELEASE_NOTES.md
         echo "- Robust Crash Recovery via WAL Replay + CRC32" >> RELEASE_NOTES.md
-        echo "- Staff-level Lock Hierarchy (Decoupled WAL I/O)" >> RELEASE_NOTES.md
+        echo "- Performance Optimized Lock Hierarchy (Decoupled WAL I/O)" >> RELEASE_NOTES.md
         echo "- Statistical Benchmarking Suite (Criterion)" >> RELEASE_NOTES.md
         echo "- 0 Clippy Warnings (Pedantic level)" >> RELEASE_NOTES.md
 
