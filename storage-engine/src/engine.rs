@@ -165,6 +165,7 @@ impl ApexEngine {
         let wal_dirty = Arc::new(AtomicBool::new(false));
         let wal_arc = Arc::new(Mutex::new(wal));
         let manifest_arc = Arc::new(Mutex::new(manifest));
+        let version_arc = Arc::new(ArcSwap::from_pointee(version));
 
         // ---- Spawn background sync task if Delayed ----
         if let SyncPolicy::Delayed(interval) = &sync_policy {
@@ -180,9 +181,27 @@ impl ApexEngine {
             });
         }
 
+        // ---- Spawn background compaction task ----
+        let comp_data_dir = data_dir.clone();
+        let comp_version = Arc::clone(&version_arc);
+        let comp_manifest = Arc::clone(&manifest_arc);
+        let comp_cache = block_cache.clone();
+        let comp_shutdown = Arc::clone(&shutdown);
+
+        tokio::spawn(async move {
+            Self::compaction_loop(
+                comp_data_dir,
+                comp_version,
+                comp_manifest,
+                comp_cache,
+                comp_shutdown,
+            )
+            .await;
+        });
+
         Ok(Self {
             data_dir,
-            version: Arc::new(ArcSwap::from_pointee(version)),
+            version: version_arc,
             manifest: manifest_arc,
             wal: wal_arc,
             immutable_memtables,
