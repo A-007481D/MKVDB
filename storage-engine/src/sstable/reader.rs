@@ -23,7 +23,7 @@ pub struct Block {
 #[derive(Clone)]
 pub struct SSTableReader {
     pub id: u64,
-    pub(crate) file: Arc<std::fs::File>,
+    pub(crate) table_cache: super::cache::TableCache,
     pub(crate) sparse_index: Vec<(Bytes, u64)>,
     pub(crate) bloom_filter: Arc<Bloom<[u8]>>,
     pub(crate) block_cache: Cache<(u64, u64), Arc<Block>>,
@@ -33,8 +33,12 @@ pub struct SSTableReader {
 }
 
 impl SSTableReader {
-    pub fn open<P: AsRef<Path>>(path: P, id: u64, block_cache: Cache<(u64, u64), Arc<Block>>) -> Result<Self> {
-        let mut file = std::fs::File::open(path)?;
+    pub fn open(
+        id: u64,
+        table_cache: super::cache::TableCache,
+        block_cache: Cache<(u64, u64), Arc<Block>>,
+    ) -> Result<Self> {
+        let mut file = table_cache.get_file(id)?;
 
         // Read Footer (24 bytes at the end)
         file.seek(SeekFrom::End(-24))?;
@@ -102,7 +106,7 @@ impl SSTableReader {
 
         Ok(Self {
             id,
-            file: Arc::new(file),
+            table_cache,
             sparse_index,
             bloom_filter: Arc::new(bloom_filter),
             block_cache,
@@ -149,7 +153,7 @@ impl SSTableReader {
             // Cache miss: lock-free read from disk using pread
             let size = (next_offset - block_offset) as usize;
             let mut block_data = vec![0u8; size];
-            self.file.read_exact_at(&mut block_data, block_offset)?;
+            self.table_cache.get_file(self.id)?.read_exact_at(&mut block_data, block_offset)?;
  
             let b = Arc::new(Block {
                 data: Bytes::from(block_data),
@@ -180,7 +184,7 @@ impl SSTableReader {
         } else {
             let size = (next_offset - block_offset) as usize;
             let mut block_data = vec![0u8; size];
-            self.file.read_exact_at(&mut block_data, block_offset)?;
+            self.table_cache.get_file(self.id)?.read_exact_at(&mut block_data, block_offset)?;
 
             let b = Arc::new(Block {
                 data: Bytes::from(block_data),

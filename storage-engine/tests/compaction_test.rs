@@ -12,7 +12,7 @@ async fn test_compaction_shrink() {
     for i in 0..5 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
         engine.force_flush().unwrap();
     }
 
@@ -55,7 +55,7 @@ async fn test_ghost_read_concurrency() {
     for i in 0..100 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
     }
     engine.force_flush().unwrap();
 
@@ -77,7 +77,7 @@ async fn test_ghost_read_concurrency() {
     for i in 100..200 {
         let key = Bytes::from(format!("key_{:03}", i));
         let val = Bytes::from(format!("value_{:03}", i));
-        engine.put(key, val).unwrap();
+        engine.put(key, val).await.unwrap();
         if i % 10 == 0 {
             engine.force_flush().unwrap();
         }
@@ -95,16 +95,16 @@ async fn test_tombstone_purge() {
     let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).unwrap();
 
     // 1. Insert a key
-    engine.put(Bytes::from("key_to_delete"), Bytes::from("value")).unwrap();
+    engine.put(Bytes::from("key_to_delete"), Bytes::from("value")).await.unwrap();
     engine.force_flush().unwrap();
 
     // 2. Delete the key
-    engine.delete(Bytes::from("key_to_delete")).unwrap();
+    engine.delete(Bytes::from("key_to_delete")).await.unwrap();
     engine.force_flush().unwrap();
 
     // 3. Trigger more flushes to ensure compaction triggers
     for i in 0..10 {
-        engine.put(Bytes::from(format!("other_{}", i)), Bytes::from("val")).unwrap();
+        engine.put(Bytes::from(format!("other_{}", i)), Bytes::from("val")).await.unwrap();
         engine.force_flush().unwrap();
     }
 

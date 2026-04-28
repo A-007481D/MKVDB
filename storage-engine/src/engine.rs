@@ -73,10 +73,11 @@ pub struct Version {
 /// in-memory memtable insert + size check.
 pub struct ApexEngine {
     pub(crate) data_dir: PathBuf,
-    pub(crate) version: Arc<ArcSwap<Version>>,
+    pub(crate) version_set: Arc<ArcSwap<Version>>,
     pub(crate) manifest: Arc<Mutex<Manifest>>,
     pub(crate) wal: Arc<Mutex<WalWriter>>,
     pub(crate) immutable_memtables: Arc<ImmutableMemTables>,
+    pub(crate) table_cache: crate::sstable::cache::TableCache,
     pub(crate) block_cache: Cache<(u64, u64), Arc<Block>>,
     /// Monotonically increasing sequence number. Atomic so the WAL append
     /// (under Mutex) and the memtable insert can share the value without
@@ -90,16 +91,18 @@ pub struct ApexEngine {
     /// Set to true if there is un-synced WAL data in the buffer.
     /// The background sync task checks this to avoid unnecessary fsync calls.
     wal_dirty: Arc<AtomicBool>,
+    /// Notifies waiters when a background sync has completed.
+    sync_notifier: Arc<tokio::sync::Notify>,
 }
 
 impl ApexEngine {
     /// Opens the database at `path`, replaying WALs for crash recovery.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Arc<Self>> {
         Self::open_with_policy(path, SyncPolicy::EveryWrite)
     }
 
     /// Opens the database with a specific WAL sync policy.
-    pub fn open_with_policy<P: AsRef<Path>>(path: P, sync_policy: SyncPolicy) -> Result<Self> {
+    pub fn open_with_policy<P: AsRef<Path>>(path: P, sync_policy: SyncPolicy) -> Result<Arc<Self>> {
         let data_dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
@@ -107,21 +110,12 @@ impl ApexEngine {
         let mut manifest = Manifest::open(&manifest_path)?;
 
         let block_cache: Cache<(u64, u64), Arc<Block>> = Cache::new(1024 * 1024 * 1024 / 4096);
+        let table_cache = crate::sstable::cache::TableCache::new(&data_dir, 512); // Limit to 512 open files
         let immutable_memtables = Arc::new(ImmutableMemTables::new());
 
         // ---- Recover SSTables listed in the MANIFEST ----
-        let mut sstables = Vec::new();
-        if let Some(ids) = manifest.levels.get(&0) {
-            let mut sorted_ids: Vec<u64> = ids.iter().copied().collect();
-            sorted_ids.sort_unstable();
-            for id in sorted_ids {
-                let sst_path = data_dir.join(format!("{id:06}.sst"));
-                if sst_path.exists() {
-                    let reader = SSTableReader::open(&sst_path, id, block_cache.clone())?;
-                    sstables.push(Arc::new(reader));
-                }
-            }
-        }
+        let sstables = Self::recover_sstables(&data_dir, &manifest, table_cache.clone(), block_cache.clone())?;
+
 
         // ---- Replay WAL files not yet flushed to SSTables ----
         let active_memtable = Arc::new(MemTable::new());
@@ -155,69 +149,98 @@ impl ApexEngine {
         let wal_path = data_dir.join(format!("{wal_id:06}.wal"));
         let wal = WalWriter::open(&wal_path, recovered_lsn)?;
 
-        let version = Version {
-            active_memtable,
-            sstables,
-        };
-
+        // ---- Initialize Engine State ----
         let metrics = Arc::new(EngineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let wal_dirty = Arc::new(AtomicBool::new(false));
-        let wal_arc = Arc::new(Mutex::new(wal));
-        let manifest_arc = Arc::new(Mutex::new(manifest));
-        let version_arc = Arc::new(ArcSwap::from_pointee(version));
+        let sync_notifier = Arc::new(tokio::sync::Notify::new());
+
+        let engine = Arc::new(Self {
+            data_dir,
+            version_set: Arc::new(ArcSwap::from_pointee(Version {
+                active_memtable: active_memtable.clone(),
+                sstables: sstables.clone(),
+            })),
+            manifest: Arc::new(Mutex::new(manifest)),
+            wal: Arc::new(Mutex::new(wal)),
+            immutable_memtables,
+            table_cache,
+            block_cache,
+            next_lsn: AtomicU64::new(recovered_lsn),
+            sync_policy: sync_policy.clone(),
+            metrics,
+            shutdown,
+            wal_dirty,
+            sync_notifier,
+        });
 
         // ---- Spawn background sync task if Delayed ----
         if let SyncPolicy::Delayed(interval) = &sync_policy {
-            let wal_ref = Arc::clone(&wal_arc);
-            let dirty_ref = Arc::clone(&wal_dirty);
-            let shutdown_ref = Arc::clone(&shutdown);
-            let metrics_ref = Arc::clone(&metrics);
+            let wal_ref = Arc::clone(&engine.wal);
+            let dirty_ref = Arc::clone(&engine.wal_dirty);
+            let shutdown_ref = Arc::clone(&engine.shutdown);
+            let metrics_ref = Arc::clone(&engine.metrics);
+            let notifier_ref = Arc::clone(&engine.sync_notifier);
             let interval = *interval;
 
             tokio::spawn(async move {
-                Self::background_sync_loop(wal_ref, dirty_ref, shutdown_ref, metrics_ref, interval)
+                Self::background_sync_loop(wal_ref, dirty_ref, shutdown_ref, metrics_ref, notifier_ref, interval)
                     .await;
             });
         }
 
         // ---- Spawn background compaction task ----
-        let comp_data_dir = data_dir.clone();
-        let comp_version = Arc::clone(&version_arc);
-        let comp_manifest = Arc::clone(&manifest_arc);
-        let comp_cache = block_cache.clone();
-        let comp_shutdown = Arc::clone(&shutdown);
+        let comp_version = Arc::clone(&engine.version_set);
+        let comp_manifest = Arc::clone(&engine.manifest);
+        let comp_cache = engine.block_cache.clone();
+        let comp_table_cache = engine.table_cache.clone();
+        let comp_dir = engine.data_dir.clone();
+        let comp_shutdown = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(async move {
             Self::compaction_loop(
-                comp_data_dir,
+                comp_dir,
                 comp_version,
                 comp_manifest,
+                comp_table_cache,
                 comp_cache,
                 comp_shutdown,
             )
             .await;
         });
 
-        Ok(Self {
-            data_dir,
-            version: version_arc,
-            manifest: manifest_arc,
-            wal: wal_arc,
-            immutable_memtables,
-            block_cache,
-            next_lsn: AtomicU64::new(recovered_lsn),
-            sync_policy,
-            metrics,
-            shutdown,
-            wal_dirty,
-        })
+        Ok(engine)
+    }
+
+    fn recover_sstables(
+        data_dir: &Path,
+        manifest: &Manifest,
+        table_cache: crate::sstable::cache::TableCache,
+        block_cache: Cache<(u64, u64), Arc<Block>>,
+    ) -> Result<Vec<Arc<SSTableReader>>> {
+        let mut sstables = Vec::new();
+        for level_ssts in manifest.levels.values() {
+            for &sst_id in level_ssts {
+                let reader = SSTableReader::open(sst_id, table_cache.clone(), block_cache.clone())?;
+                sstables.push(Arc::new(reader));
+            }
+        }
+        Ok(sstables)
     }
 
     /// Returns a reference to the engine's I/O metrics.
     #[must_use]
     pub fn metrics(&self) -> &Arc<EngineMetrics> {
         &self.metrics
+    }
+
+    /// Creates a point-in-time snapshot of the current version.
+    /// This snapshot will remain valid even if compaction deletes files.
+    pub fn snapshot(self: &Arc<Self>) -> Snapshot {
+        Snapshot {
+            engine: Arc::clone(self),
+            version: self.version_set.load_full(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -231,6 +254,7 @@ impl ApexEngine {
         dirty: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<EngineMetrics>,
+        notifier: Arc<tokio::sync::Notify>,
         interval: Duration,
     ) {
         loop {
@@ -249,12 +273,14 @@ impl ApexEngine {
 
             // Only sync if there is un-flushed data
             if dirty.swap(false, Ordering::AcqRel) {
-                let mut guard = wal.lock();
-                if let Err(e) = guard.sync() {
+                let mut wal_guard = wal.lock();
+                if let Err(e) = wal_guard.sync() {
                     eprintln!("Background WAL sync failed: {e:?}");
                 } else {
                     metrics.record_wal_sync();
                 }
+                // Notify everyone who was waiting for this sync batch
+                notifier.notify_waiters();
             }
         }
     }
@@ -263,13 +289,13 @@ impl ApexEngine {
     // Write path
     // -----------------------------------------------------------------------
 
-    pub fn put(&self, key: Bytes, value: Bytes) -> Result<()> {
+    pub async fn put(&self, key: Bytes, value: Bytes) -> Result<()> {
         self.metrics.record_put();
-        self.write_internal(key, EntryValue::Value(value))
+        self.write_internal(key, EntryValue::Value(value)).await
     }
 
-    pub fn delete(&self, key: Bytes) -> Result<()> {
-        self.write_internal(key, EntryValue::Tombstone)
+    pub async fn delete(&self, key: Bytes) -> Result<()> {
+        self.write_internal(key, EntryValue::Tombstone).await
     }
 
     /// Core write path.
@@ -277,36 +303,38 @@ impl ApexEngine {
     /// 1. Acquire WAL mutex → append + optional fsync  (disk I/O, no version lock)
     /// 2. Acquire version read-lock → insert into memtable (nanoseconds, in-memory)
     /// 3. If memtable is full → rotate (still under version lock, but fast)
-    fn write_internal(&self, key: Bytes, value: EntryValue) -> Result<()> {
-        // --- Phase 1: WAL I/O (outside version lock) ---
-        let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
-        let bytes_written;
+    async fn write_internal(&self, key: Bytes, value: EntryValue) -> Result<()> {
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
+        let bytes_written;
+        // --- Phase 1: WAL append (under Mutex) ---
         {
             let mut wal = self.wal.lock();
-            bytes_written = wal.append(&key, &value)?;
+            bytes_written = wal.append(lsn, &key, &value)?;
 
-            match &self.sync_policy {
+            match self.sync_policy {
                 SyncPolicy::EveryWrite => {
                     wal.sync()?;
                     self.metrics.record_wal_sync();
                 }
-                SyncPolicy::Buffered => {
-                    // Caller is responsible for calling flush_wal()
-                }
                 SyncPolicy::Delayed(_) => {
-                    // Mark dirty — the background task will sync
                     self.wal_dirty.store(true, Ordering::Release);
                 }
+                SyncPolicy::Buffered => {}
             }
         } // WAL mutex released
 
         self.metrics.record_wal_write(bytes_written);
 
+        // If Delayed, wait for the background worker to sync
+        if let SyncPolicy::Delayed(_) = self.sync_policy {
+            self.sync_notifier.notified().await;
+        }
+
         // --- Phase 2: MemTable insert (lock-free) ---
         let needs_flush;
         {
-            let version = self.version.load();
+            let version = self.version_set.load();
             version.active_memtable.put(key, value, lsn);
             needs_flush = version.active_memtable.size() >= MEMTABLE_SIZE_LIMIT;
         } // version guard released
@@ -339,7 +367,7 @@ impl ApexEngine {
             let mut manifest = self.manifest.lock();
 
             // Rotate memtable & create new version
-            let old = self.version.load().active_memtable.clone();
+            let old = self.version_set.load().active_memtable.clone();
             self.immutable_memtables.push(Arc::clone(&old));
 
             // Rotate WAL
@@ -357,20 +385,21 @@ impl ApexEngine {
             let sst_id = manifest.generate_file_id();
             let sst_path = self.data_dir.join(format!("{sst_id:06}.sst"));
 
-            let current_version = self.version.load();
+            let current_version = self.version_set.load();
             let new_version = Version {
                 active_memtable: Arc::new(MemTable::new()),
                 sstables: current_version.sstables.clone(),
             };
-            self.version.store(Arc::new(new_version));
+            self.version_set.store(Arc::new(new_version));
 
             (old, sst_id, sst_path, new_wal_id)
         }; // manifest lock released
 
         // Spawn background flush
         let block_cache = self.block_cache.clone();
+        let table_cache = self.table_cache.clone();
         let imm_queue = Arc::clone(&self.immutable_memtables);
-        let version_arc = Arc::clone(&self.version);
+        let version_arc = Arc::clone(&self.version_set);
         let manifest_arc = Arc::clone(&self.manifest);
 
         tokio::spawn(async move {
@@ -379,6 +408,7 @@ impl ApexEngine {
                 sst_id,
                 wal_id,
                 old_memtable,
+                table_cache,
                 block_cache,
                 imm_queue,
                 version_arc,
@@ -401,6 +431,7 @@ impl ApexEngine {
         sst_id: u64,
         wal_id: u64,
         memtable: Arc<MemTable>,
+        table_cache: crate::sstable::cache::TableCache,
         block_cache: Cache<(u64, u64), Arc<Block>>,
         immutable_queue: Arc<ImmutableMemTables>,
         version_arc: Arc<ArcSwap<Version>>,
@@ -413,8 +444,8 @@ impl ApexEngine {
         }
         builder.finish()?;
 
-        // 2. Update version set (lock-free swap via ArcSwap)
-        let reader = SSTableReader::open(&sst_path, sst_id, block_cache)?;
+        // 2. Commit SSTable to VersionSet (with atomic switch)
+        let reader = SSTableReader::open(sst_id, table_cache, block_cache)?;
         
         // We use a simple loop for compare-and-swap if another thread (e.g. compaction) 
         // updated the version in the meantime.
@@ -454,15 +485,11 @@ impl ApexEngine {
     // Read path
     // -----------------------------------------------------------------------
 
-    /// Point lookup. Searches: active memtable → immutable queue → SSTables.
-    ///
-    /// Uses only a **shared** (`read`) lock on the version set, so multiple
-    /// threads can read concurrently without blocking each other or writers.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.metrics.record_get();
 
         // 1. Active MemTable (lock-free)
-        let version = self.version.load();
+        let version = self.version_set.load();
         if let Some(val) = version.active_memtable.get(key) {
             return match val {
                 EntryValue::Value(v) => Ok(Some(v)),
@@ -496,7 +523,7 @@ impl ApexEngine {
     pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanIterator> {
         let mut iterators: Vec<Box<dyn DbIterator>> = Vec::new();
 
-        let version = self.version.load();
+        let version = self.version_set.load();
 
         // Active MemTable
         iterators.push(Box::new(MemTableIterator::new(version.active_memtable.clone())));
@@ -575,5 +602,33 @@ impl Drop for ApexEngine {
         if let Some(mut wal) = self.wal.try_lock() {
             let _ = wal.sync();
         }
+    }
+}
+/// A point-in-time view of the database.
+pub struct Snapshot {
+    #[allow(dead_code)]
+    engine: Arc<ApexEngine>,
+    version: Arc<Version>,
+}
+
+impl Snapshot {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if let Some(val) = self.version.active_memtable.get(key) {
+            return match val {
+                EntryValue::Value(v) => Ok(Some(v)),
+                EntryValue::Tombstone => Ok(None),
+            };
+        }
+
+        for reader in self.version.sstables.iter().rev() {
+            if let Some((val, _lsn)) = reader.get(key)? {
+                return match val {
+                    EntryValue::Value(v) => Ok(Some(v)),
+                    EntryValue::Tombstone => Ok(None),
+                };
+            }
+        }
+
+        Ok(None)
     }
 }

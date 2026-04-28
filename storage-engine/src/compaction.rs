@@ -22,6 +22,7 @@ impl ApexEngine {
         data_dir: PathBuf,
         version: Arc<ArcSwap<Version>>,
         manifest: Arc<Mutex<Manifest>>,
+        table_cache: crate::sstable::cache::TableCache,
         block_cache: Cache<(u64, u64), Arc<Block>>,
         shutdown: Arc<AtomicBool>,
     ) {
@@ -36,6 +37,7 @@ impl ApexEngine {
                 &data_dir,
                 &version,
                 &manifest,
+                &table_cache,
                 &block_cache,
             ) {
                 eprintln!("Compaction error: {e:?}");
@@ -47,6 +49,7 @@ impl ApexEngine {
         data_dir: &PathBuf,
         version_arc: &Arc<ArcSwap<Version>>,
         manifest_arc: &Arc<Mutex<Manifest>>,
+        table_cache: &crate::sstable::cache::TableCache,
         block_cache: &Cache<(u64, u64), Arc<Block>>,
     ) -> Result<()> {
         let manifest_guard = manifest_arc.lock();
@@ -116,7 +119,7 @@ impl ApexEngine {
                 let builder = current_builder.take().unwrap();
                 builder.finish()?;
                 // Open reader for the new SSTable
-                let reader = SSTableReader::open(&current_path, current_id, block_cache.clone())?;
+                let reader = SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
                 remaining_sstables.push(Arc::new(reader));
             }
 
@@ -126,7 +129,7 @@ impl ApexEngine {
         if let Some(builder) = current_builder {
             if builder.estimated_size() > 0 {
                 builder.finish()?;
-                let reader = SSTableReader::open(&current_path, current_id, block_cache.clone())?;
+                let reader = SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
                 remaining_sstables.push(Arc::new(reader));
             } else {
                 // Remove empty file

@@ -45,9 +45,8 @@ impl WalWriter {
     /// Appends a new key-value pair to the log buffer.
     /// Does NOT fsync immediately. Call `sync()` to ensure durability.
     /// Returns the total number of bytes written (for metrics).
-    pub fn append(&mut self, key: &[u8], value: &EntryValue) -> Result<u64> {
-        let lsn = self.current_lsn;
-        self.current_lsn += 1;
+    pub fn append(&mut self, lsn: u64, key: &[u8], value: &EntryValue) -> Result<u64> {
+        self.current_lsn = lsn + 1;
 
         let mut record_bytes = Vec::new();
 
