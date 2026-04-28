@@ -287,10 +287,9 @@ impl Stream for ScanStream {
             let key = self.merger.key();
 
             // Check range bounds (Inclusive)
-            if let Some(end) = &self.end_key {
-                if key.as_ref() > end.as_ref() {
-                    return Poll::Ready(None);
-                }
+            if let Some(end) = &self.end_key
+                && key.as_ref() > end.as_ref() {
+                return Poll::Ready(None);
             }
 
             let value = self.merger.value();
@@ -301,10 +300,10 @@ impl Stream for ScanStream {
             }
 
             // Filter out tombstones and yield values
-            match value {
-                EntryValue::Value(v) => return Poll::Ready(Some(Ok((key, v)))),
-                EntryValue::Tombstone => continue, // Skip and check next element
+            if let EntryValue::Value(v) = value {
+                return Poll::Ready(Some(Ok((key, v))));
             }
+            // Skip tombstones and check next element
         }
     }
 }

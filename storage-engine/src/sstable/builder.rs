@@ -90,6 +90,7 @@ impl SSTableBuilder {
     }
 
     /// Returns the approximate size of the data written so far.
+    #[must_use]
     pub fn estimated_size(&self) -> u64 {
         self.current_offset + self.current_block.len() as u64
     }

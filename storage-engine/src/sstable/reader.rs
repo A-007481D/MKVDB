@@ -190,7 +190,7 @@ impl SSTableReader {
 
         // Decompress the block
         let decompressed_data = lz4_flex::decompress_size_prepended(compressed_data)
-            .map_err(|e| ApexError::Corruption(format!("Lz4 decompression failed: {}", e)))?;
+            .map_err(|e| ApexError::Corruption(format!("Lz4 decompression failed: {e}")))?;
 
         let b = Arc::new(Block {
             data: Bytes::from(decompressed_data),

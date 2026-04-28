@@ -234,20 +234,18 @@ impl ApexEngine {
             let name = path.file_name().unwrap().to_string_lossy();
 
             if name.ends_with(".sst") {
-                let stem = name.strip_suffix(".sst").unwrap();
-                if let Ok(id) = stem.parse::<u64>() {
-                    if !active_ssts.contains(&id) {
-                        info!("Startup GC: Deleting zombie SSTable {}", name);
-                        let _ = std::fs::remove_file(&path);
-                    }
+                if let Some(id_str) = name.strip_suffix(".sst")
+                    && let Ok(id) = id_str.parse::<u64>()
+                    && !active_ssts.contains(&id) {
+                    info!("Startup GC: Deleting zombie SSTable {name}");
+                    let _ = std::fs::remove_file(&path);
                 }
             } else if name.ends_with(".wal") {
-                let stem = name.strip_suffix(".wal").unwrap();
-                if let Ok(id) = stem.parse::<u64>() {
-                    if id < manifest.wal_id {
-                        info!("Startup GC: Deleting obsolete WAL {}", name);
-                        let _ = std::fs::remove_file(&path);
-                    }
+                if let Some(id_str) = name.strip_suffix(".wal")
+                    && let Ok(id) = id_str.parse::<u64>()
+                    && id < manifest.wal_id {
+                    info!("Startup GC: Deleting obsolete WAL {name}");
+                    let _ = std::fs::remove_file(&path);
                 }
             } else if name.ends_with(".tmp") {
                 info!("Startup GC: Deleting orphaned temporary file {}", name);
@@ -503,6 +501,7 @@ impl ApexEngine {
     /// The MANIFEST update is the **last** step. If we crash before the
     /// MANIFEST is written, the SSTable file is orphaned (harmless) and the
     /// data will be replayed from the WAL on restart.
+    #[allow(clippy::too_many_arguments)]
     fn flush_memtable(
         sst_path: PathBuf,
         sst_id: u64,
@@ -675,10 +674,10 @@ impl ApexEngine {
 
         // 2. Hard-link SSTables
         for id in active_ssts {
-            let name = format!("{:06}.sst", id);
+            let name = format!("{id:06}.sst");
             let src = self.data_dir.join(&name);
             let dst = cp_path.join(&name);
-            tracing::debug!("Checkpoint: Hard-linking {}", name);
+            tracing::debug!("Checkpoint: Hard-linking {name}");
             std::fs::hard_link(src, dst)?;
         }
 
@@ -695,18 +694,18 @@ impl ApexEngine {
         let active_wal_id = self.wal.lock().id;
         
         for id in wal_id..=active_wal_id {
-            let name = format!("{:06}.wal", id);
+            let name = format!("{id:06}.wal");
             let src = self.data_dir.join(&name);
             let dst = cp_path.join(&name);
             
             if !src.exists() {
                 // It's possible some older WALs were already cleaned up if they 
                 // were flushed but the manifest watermark hasn't moved yet?
-                tracing::warn!("Checkpoint: Expected WAL {} not found, skipping", name);
+                tracing::warn!("Checkpoint: Expected WAL {name} not found, skipping");
                 continue;
             }
 
-            tracing::debug!("Checkpoint: Copying/Linking WAL {}", name);
+            tracing::debug!("Checkpoint: Copying/Linking WAL {name}");
             if id == active_wal_id {
                 // Active WAL needs a lock and sync
                 let mut wal_guard = self.wal.lock();

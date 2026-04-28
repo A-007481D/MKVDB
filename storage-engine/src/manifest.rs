@@ -137,7 +137,7 @@ impl Manifest {
             // Write all active tables
             for (level, sst_ids) in &self.levels {
                 for &id in sst_ids {
-                    temp_file.write_all(format!("ADD,{},{}\n", level, id).as_bytes())?;
+                    temp_file.write_all(format!("ADD,{level},{id}\n").as_bytes())?;
                 }
             }
             

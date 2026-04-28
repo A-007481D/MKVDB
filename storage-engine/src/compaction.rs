@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::Mutex;
 use crate::engine::Version;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use moka::sync::Cache;
 
 const TARGET_SST_SIZE: usize = 64 * 1024 * 1024; // 64 MB
@@ -45,8 +45,9 @@ impl ApexEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn maybe_compact(
-        data_dir: &PathBuf,
+        data_dir: &Path,
         version_arc: &Arc<ArcSwap<Version>>,
         manifest_arc: &Arc<Mutex<Manifest>>,
         table_cache: &crate::sstable::cache::TableCache,
@@ -109,7 +110,7 @@ impl ApexEngine {
                     let mut manifest_guard = manifest_arc.lock();
                     current_id = manifest_guard.generate_file_id();
                 }
-                current_path = data_dir.join(format!("{:06}.sst", current_id));
+                current_path = data_dir.join(format!("{current_id:06}.sst"));
                 // Estimated keys: we don't know, but let's assume 100k for the bloom filter
                 current_builder = Some(SSTableBuilder::new(&current_path, 100_000)?);
                 new_l1_ids.push(current_id);
@@ -195,7 +196,7 @@ impl ApexEngine {
 
         // 3. Self-Cleaning: Unlink old files
         for id in l0_ids.iter().chain(l1_ids.iter()) {
-            let path = data_dir.join(format!("{:06}.sst", id));
+            let path = data_dir.join(format!("{id:06}.sst"));
             tracing::info!("Compaction: Purging old SSTable {}", id);
             let _ = std::fs::remove_file(path);
         }

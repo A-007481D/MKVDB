@@ -30,7 +30,7 @@ impl TableCache {
         }
 
         // Cache miss, open the file
-        let path = self.data_dir.join(format!("{:06}.sst", id));
+        let path = self.data_dir.join(format!("{id:06}.sst"));
         let file = File::open(path)?;
         let arc_file = Arc::new(file);
         

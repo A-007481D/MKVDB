@@ -17,6 +17,7 @@ pub(crate) enum BatchOp {
 
 impl WriteBatch {
     /// Creates a new, empty write batch.
+    #[must_use]
     pub fn new() -> Self {
         Self { ops: Vec::new() }
     }
@@ -32,11 +33,13 @@ impl WriteBatch {
     }
 
     /// Returns the number of operations in the batch.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
     /// Returns true if the batch is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }

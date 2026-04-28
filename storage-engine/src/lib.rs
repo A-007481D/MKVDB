@@ -15,7 +15,11 @@
     clippy::missing_panics_doc,
     clippy::doc_markdown,
     clippy::needless_pass_by_value,
-    clippy::iter_without_into_iter
+    clippy::iter_without_into_iter,
+    clippy::must_use_candidate,
+    clippy::manual_let_else,
+    clippy::ignored_unit_patterns,
+    clippy::cast_sign_loss
 )]
 
 pub mod engine;

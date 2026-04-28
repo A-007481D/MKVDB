@@ -120,30 +120,30 @@ impl WalReader {
         
         let mut lsn_buf = [0u8; 8];
         if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
-            return self.handle_eof(e);
+            return Self::handle_eof(e);
         }
         let lsn = u64::from_le_bytes(lsn_buf);
 
         let mut key_len_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut key_len_buf) {
-            return self.handle_eof(e);
+            return Self::handle_eof(e);
         }
         let key_len = u32::from_le_bytes(key_len_buf) as usize;
 
         let mut key_buf = vec![0u8; key_len];
         if let Err(e) = self.reader.read_exact(&mut key_buf) {
-            return self.handle_eof(e);
+            return Self::handle_eof(e);
         }
 
         let mut is_tombstone_buf = [0u8; 1];
         if let Err(e) = self.reader.read_exact(&mut is_tombstone_buf) {
-            return self.handle_eof(e);
+            return Self::handle_eof(e);
         }
         let is_tombstone = is_tombstone_buf[0] == 1;
 
         let mut val_len_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut val_len_buf) {
-            return self.handle_eof(e);
+            return Self::handle_eof(e);
         }
         let val_len = u32::from_le_bytes(val_len_buf) as usize;
 
@@ -152,7 +152,7 @@ impl WalReader {
         } else {
             let mut val_buf = vec![0u8; val_len];
             if let Err(e) = self.reader.read_exact(&mut val_buf) {
-                return self.handle_eof(e);
+                return Self::handle_eof(e);
             }
             EntryValue::Value(Bytes::from(val_buf))
         };
@@ -186,7 +186,7 @@ impl WalReader {
         }))
     }
 
-    fn handle_eof(&self, err: std::io::Error) -> Result<Option<WalRecord>> {
+    fn handle_eof(err: std::io::Error) -> Result<Option<WalRecord>> {
         if err.kind() == std::io::ErrorKind::UnexpectedEof {
             // This is a Torn Write. We logged the checksum but the power 
             // cut before the full payload was written. 

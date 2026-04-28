@@ -100,10 +100,10 @@ impl DbIterator for SSTableIterator {
                 self.cursor = cursor;
                 self.current_entry = Some((entry_key, entry_val, lsn));
                 return Ok(true);
-            } else {
-                self.current_entry = None;
-                return Ok(false);
-            }
+            } 
+            
+            self.current_entry = None;
+            return Ok(false);
         }
         
         self.current_entry = None;
