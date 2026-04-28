@@ -96,16 +96,7 @@ impl Manifest {
 
     /// Logs an event to the MANIFEST and fsyncs it for crash consistency.
     pub fn log_event(&mut self, event: ManifestEvent) -> Result<()> {
-        let line = match &event {
-            ManifestEvent::AddTable { level, id } => format!("ADD,{level},{id}\n"),
-            ManifestEvent::RemoveTable { level, id } => format!("RM,{level},{id}\n"),
-            ManifestEvent::SetWalId { wal_id } => format!("WAL,{wal_id}\n"),
-        };
-
-        self.file.write_all(line.as_bytes())?;
-        self.file.sync_all()?;
-
-        // Mirror into in-memory state
+        // 1. Mirror into in-memory state
         match event {
             ManifestEvent::AddTable { level, id } => {
                 self.levels.entry(level).or_default().insert(id);
@@ -122,7 +113,8 @@ impl Manifest {
             }
         }
 
-        Ok(())
+        // 2. Persist atomically by rewriting the manifest
+        self.checkpoint()
     }
 
     /// Rewrites the MANIFEST into a clean, collapsed state.

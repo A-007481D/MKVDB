@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::manifest::{Manifest, ManifestEvent};
+use std::collections::HashSet;
 use crate::memtable::{EntryValue, ImmutableMemTables, MemTable};
 use crate::metrics::EngineMetrics;
 use crate::sstable::builder::SSTableBuilder;
@@ -108,8 +109,12 @@ impl ApexEngine {
         let data_dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
+        // ---- Load Manifest ----
         let manifest_path = data_dir.join("MANIFEST");
         let mut manifest = Manifest::open(&manifest_path)?;
+
+        // ---- Startup GC: Clean up zombie files ----
+        Self::startup_gc(&data_dir, &manifest)?;
 
         let block_cache: Cache<(u64, u64), Arc<Block>> = Cache::new(1024 * 1024 * 1024 / 4096);
         let table_cache = crate::sstable::cache::TableCache::new(&data_dir, 512); // Limit to 512 open files
@@ -212,6 +217,40 @@ impl ApexEngine {
         });
 
         Ok(engine)
+    }
+
+    fn startup_gc(data_dir: &Path, manifest: &Manifest) -> Result<()> {
+        let mut active_ssts = HashSet::new();
+        for level_ssts in manifest.levels.values() {
+            for &id in level_ssts {
+                active_ssts.insert(id);
+            }
+        }
+
+        for entry in std::fs::read_dir(data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            if name.ends_with(".sst") {
+                let stem = name.strip_suffix(".sst").unwrap();
+                if let Ok(id) = stem.parse::<u64>() {
+                    if !active_ssts.contains(&id) {
+                        info!("Startup GC: Deleting zombie SSTable {}", name);
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            } else if name.ends_with(".wal") {
+                let stem = name.strip_suffix(".wal").unwrap();
+                if let Ok(id) = stem.parse::<u64>() {
+                    if id < manifest.wal_id {
+                        info!("Startup GC: Deleting obsolete WAL {}", name);
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn recover_sstables(
