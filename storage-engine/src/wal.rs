@@ -44,6 +44,7 @@ impl WalWriter {
 
     /// Appends a new key-value pair to the log buffer.
     /// Does NOT fsync immediately. Call `sync()` to ensure durability.
+    /// Returns the total number of bytes written (for metrics).
     pub fn append(&mut self, key: &[u8], value: &EntryValue) -> Result<u64> {
         let lsn = self.current_lsn;
         self.current_lsn += 1;
@@ -77,7 +78,9 @@ impl WalWriter {
         self.writer.write_all(&checksum.to_le_bytes())?;
         self.writer.write_all(&record_bytes)?;
 
-        Ok(lsn)
+        // 4 bytes checksum + record payload
+        let total_bytes = 4 + record_bytes.len() as u64;
+        Ok(total_bytes)
     }
 
     /// Flushes the user-space buffer and issues an fsync to the OS.
