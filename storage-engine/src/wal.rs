@@ -16,6 +16,7 @@ pub struct WalRecord {
 
 /// A batched Write-Ahead Log writer.
 pub struct WalWriter {
+    pub id: u64,
     file: File,
     writer: BufWriter<File>,
     current_lsn: u64,
@@ -24,18 +25,17 @@ pub struct WalWriter {
 impl WalWriter {
     /// Opens or creates a WAL file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, start_lsn: u64) -> Result<Self> {
+        let path_ref = path.as_ref();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
-            .open(path)?;
+            .open(path_ref)?;
 
-        // Need to clone the file handle for the BufWriter to allow sync_all on the original handle,
-        // or we can use BufWriter::into_inner / get_mut.
-        // Actually, BufWriter has a get_ref() to access the underlying file.
         let file_clone = file.try_clone()?;
 
         Ok(Self {
+            id: path_ref.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0),
             file: file_clone,
             writer: BufWriter::new(file),
             current_lsn: start_lsn,
