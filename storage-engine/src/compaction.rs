@@ -22,7 +22,7 @@ impl ApexEngine {
         data_dir: PathBuf,
         version: Arc<ArcSwap<Version>>,
         manifest: Arc<Mutex<Manifest>>,
-        block_cache: Cache<u64, Arc<Block>>,
+        block_cache: Cache<(u64, u64), Arc<Block>>,
         shutdown: Arc<AtomicBool>,
     ) {
         loop {
@@ -47,7 +47,7 @@ impl ApexEngine {
         data_dir: &PathBuf,
         version_arc: &Arc<ArcSwap<Version>>,
         manifest_arc: &Arc<Mutex<Manifest>>,
-        block_cache: &Cache<u64, Arc<Block>>,
+        block_cache: &Cache<(u64, u64), Arc<Block>>,
     ) -> Result<()> {
         let manifest_guard = manifest_arc.lock();
         
@@ -137,9 +137,25 @@ impl ApexEngine {
         // 1. Update Version
         loop {
             let curr = version_arc.load();
+            
+            // We must preserve any SSTables that were added by concurrent flushes
+            // while this compaction was running.
+            let mut final_sstables = remaining_sstables.clone();
+            for sst in &curr.sstables {
+                // If this sst was NOT part of the compaction input, and it's NOT
+                // one of our new L1 outputs (which are already in remaining_sstables),
+                // then it must be a concurrent flush.
+                if !l0_ids.contains(&sst.id) && 
+                   !l1_ids.contains(&sst.id) && 
+                   !new_l1_ids.contains(&sst.id) 
+                {
+                    final_sstables.push(Arc::clone(sst));
+                }
+            }
+
             let new_version = Arc::new(Version {
                 active_memtable: Arc::clone(&curr.active_memtable),
-                sstables: remaining_sstables.clone(),
+                sstables: final_sstables,
             });
 
             let prev = version_arc.compare_and_swap(&curr, new_version);

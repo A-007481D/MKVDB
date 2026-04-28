@@ -26,14 +26,14 @@ pub struct SSTableReader {
     pub(crate) file: Arc<std::fs::File>,
     pub(crate) sparse_index: Vec<(Bytes, u64)>,
     pub(crate) bloom_filter: Arc<Bloom<[u8]>>,
-    pub(crate) block_cache: Cache<u64, Arc<Block>>,
+    pub(crate) block_cache: Cache<(u64, u64), Arc<Block>>,
     /// The byte offset where the sparse index begins in the file.
     /// Used to determine the size of the last data block.
     pub(crate) index_offset: u64,
 }
 
 impl SSTableReader {
-    pub fn open<P: AsRef<Path>>(path: P, id: u64, block_cache: Cache<u64, Arc<Block>>) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, id: u64, block_cache: Cache<(u64, u64), Arc<Block>>) -> Result<Self> {
         let mut file = std::fs::File::open(path)?;
 
         // Read Footer (24 bytes at the end)
@@ -142,18 +142,19 @@ impl SSTableReader {
         };
 
         // 3. Block Cache lookup — thread-safe, no file mutex needed
-        let block = if let Some(b) = self.block_cache.get(&block_offset) {
+        let cache_key = (self.id, block_offset);
+        let block = if let Some(b) = self.block_cache.get(&cache_key) {
             b
         } else {
             // Cache miss: lock-free read from disk using pread
             let size = (next_offset - block_offset) as usize;
             let mut block_data = vec![0u8; size];
             self.file.read_exact_at(&mut block_data, block_offset)?;
-
+ 
             let b = Arc::new(Block {
                 data: Bytes::from(block_data),
             });
-            self.block_cache.insert(block_offset, Arc::clone(&b));
+            self.block_cache.insert(cache_key, Arc::clone(&b));
             b
         };
 
@@ -173,7 +174,8 @@ impl SSTableReader {
             self.index_offset
         };
 
-        if let Some(b) = self.block_cache.get(&block_offset) {
+        let cache_key = (self.id, block_offset);
+        if let Some(b) = self.block_cache.get(&cache_key) {
             Ok(b)
         } else {
             let size = (next_offset - block_offset) as usize;
@@ -183,7 +185,7 @@ impl SSTableReader {
             let b = Arc::new(Block {
                 data: Bytes::from(block_data),
             });
-            self.block_cache.insert(block_offset, Arc::clone(&b));
+            self.block_cache.insert(cache_key, Arc::clone(&b));
             Ok(b)
         }
     }
