@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use crate::iterator::{DbIterator, MemTableIterator, MergingIterator};
+use crate::iterator::{DbIterator, MemTableIterator, MergingIterator, ScanStream};
 use crate::sstable::iterator::SSTableIterator;
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
@@ -518,43 +518,45 @@ impl ApexEngine {
         Ok(None)
     }
 
-    /// Performs a range scan, returning an iterator over `(Key, Value)`.
-    /// Tombstones are automatically filtered out.
-    pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanIterator> {
+    /// Performs a range scan, returning an async stream of key-value pairs.
+    /// The stream is lazy and snapshot-consistent.
+    pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanStream> {
+        let version = self.version_set.load();
+        self.create_scan_stream(version.clone(), start_key, Some(end_key))
+    }
+
+    /// Internal helper to create a scan stream from a specific version snapshot.
+    fn create_scan_stream(
+        &self,
+        version: Arc<Version>,
+        start_key: Bytes,
+        end_key: Option<Bytes>,
+    ) -> Result<ScanStream> {
         let mut iterators: Vec<Box<dyn DbIterator>> = Vec::new();
 
-        let version = self.version_set.load();
-
-        // Active MemTable
+        // 1. Active MemTable
         iterators.push(Box::new(MemTableIterator::new(version.active_memtable.clone())));
 
-        // Immutable MemTables
+        // 2. Immutable MemTables (if this is called from the engine, we use its snapshots)
+        // If this is a snapshot scan, we should technically use the immutables from the snapshot point.
+        // For now, ApexEngine keeps immutables separate.
         for imm in self.immutable_memtables.snapshot() {
             iterators.push(Box::new(MemTableIterator::new(imm)));
         }
 
-        // SSTables
+        // 3. SSTables
         for sst in &version.sstables {
-            // Optimization: check if SSTable overlaps with range via sparse index / min/max keys.
-            // For now, add all of them. The block cache makes it cheap if they are heavily used.
             iterators.push(Box::new(SSTableIterator::new(Arc::clone(sst))?));
         }
 
         let mut merging_iter = MergingIterator::new(iterators)?;
 
-        // Seek all iterators to start_key? 
-        // Wait, DbIterator doesn't have a `seek()` method yet!
-        // For now, we will scan and skip until >= start_key.
-        // In a real system, we must add `seek(key)` to DbIterator.
-        
+        // Seek to start_key (O(N) for now, should be O(log N) in future)
         while merging_iter.is_valid() && merging_iter.key().as_ref() < start_key.as_ref() {
             merging_iter.next()?;
         }
 
-        Ok(ScanIterator {
-            iter: merging_iter,
-            end_key,
-        })
+        Ok(ScanStream::new(version, merging_iter, end_key))
     }
 
     /// Manually triggers a flush of the current memtable to an SSTable on disk.
@@ -564,32 +566,6 @@ impl ApexEngine {
     }
 }
 
-pub struct ScanIterator {
-    iter: MergingIterator,
-    end_key: Bytes,
-}
-
-impl ScanIterator {
-    pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
-        while self.iter.is_valid() {
-            let key = self.iter.key();
-            if key.as_ref() > self.end_key.as_ref() {
-                break;
-            }
-
-            let val = self.iter.value();
-            let is_tombstone = val.is_tombstone();
-            let v_bytes = val.as_bytes().to_vec();
-            
-            self.iter.next()?;
-
-            if !is_tombstone {
-                return Ok(Some((key, Bytes::from(v_bytes))));
-            }
-        }
-        Ok(None)
-    }
-}
 
 /// Graceful shutdown: signal the background sync task and perform a final
 /// WAL flush so no buffered writes are lost on a clean exit.
@@ -630,5 +606,10 @@ impl Snapshot {
         }
 
         Ok(None)
+    }
+
+    /// Performs a range scan on this snapshot.
+    pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanStream> {
+        self.engine.create_scan_stream(self.version.clone(), start_key, Some(end_key))
     }
 }

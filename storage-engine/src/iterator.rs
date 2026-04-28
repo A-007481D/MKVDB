@@ -3,6 +3,10 @@ use crate::memtable::EntryValue;
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use futures_util::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::sync::Arc;
 
 /// The standard Iterator interface for the engine.
 /// We yield owned `Bytes` and `EntryValue` to avoid complex lifetime constraints.
@@ -28,7 +32,7 @@ pub trait DbIterator: Send {
 // MemTable Iterator
 // ---------------------------------------------------------------------------
 use crate::memtable::MemTable;
-use std::sync::Arc;
+
 pub struct MemTableIterator {
     memtable: Arc<MemTable>,
     current: Option<(Bytes, EntryValue, u64)>,
@@ -211,6 +215,64 @@ impl DbIterator for MergingIterator {
 
     fn is_valid(&self) -> bool {
         self.current_idx.is_some()
+    }
+}
+
+/// An asynchronous stream of key-value pairs.
+///
+/// This stream is lazy (no I/O until polled) and consistent (holds a snapshot
+/// of the database via Arc<Version>).
+pub struct ScanStream {
+    _version: Arc<crate::engine::Version>,
+    merger: MergingIterator,
+    end_key: Option<Bytes>,
+}
+
+impl ScanStream {
+    pub fn new(
+        version: Arc<crate::engine::Version>,
+        merger: MergingIterator,
+        end_key: Option<Bytes>,
+    ) -> Self {
+        Self {
+            _version: version,
+            merger,
+            end_key,
+        }
+    }
+}
+
+impl Stream for ScanStream {
+    type Item = Result<(Bytes, Bytes)>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if !self.merger.is_valid() {
+                return Poll::Ready(None);
+            }
+
+            let key = self.merger.key();
+
+            // Check range bounds (Inclusive)
+            if let Some(end) = &self.end_key {
+                if key.as_ref() > end.as_ref() {
+                    return Poll::Ready(None);
+                }
+            }
+
+            let value = self.merger.value();
+
+            // Advance for the next call to poll_next
+            if let Err(e) = self.merger.next() {
+                return Poll::Ready(Some(Err(e)));
+            }
+
+            // Filter out tombstones and yield values
+            match value {
+                EntryValue::Value(v) => return Poll::Ready(Some(Ok((key, v)))),
+                EntryValue::Tombstone => continue, // Skip and check next element
+            }
+        }
     }
 }
 

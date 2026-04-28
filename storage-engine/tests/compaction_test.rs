@@ -1,4 +1,5 @@
 use storage_engine::{ApexEngine, SyncPolicy};
+use futures_util::StreamExt;
 use bytes::Bytes;
 use tempfile::tempdir;
 use std::time::Duration;
@@ -65,7 +66,8 @@ async fn test_ghost_read_concurrency() {
     let reader_handle = tokio::spawn(async move {
         let mut scan = engine_cloned.scan(Bytes::from("key_000"), Bytes::from("key_099")).unwrap();
         let mut count = 0;
-        while let Some((_k, _v)) = scan.next().unwrap() {
+        while let Some(res) = scan.next().await {
+            let _ = res.unwrap();
             count += 1;
             // Artificial delay to simulate long-running scan
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -116,5 +118,5 @@ async fn test_tombstone_purge() {
 
     // 6. Scan should not show it either
     let mut scan = engine.scan(Bytes::from("key_"), Bytes::from("key_z")).unwrap();
-    assert!(scan.next().unwrap().is_none());
+    assert!(scan.next().await.is_none());
 }
