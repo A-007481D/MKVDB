@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::manifest::{Manifest, ManifestEvent};
 use crate::memtable::{EntryValue, ImmutableMemTables, MemTable};
+use crate::metrics::EngineMetrics;
 use crate::sstable::builder::SSTableBuilder;
 use crate::sstable::reader::{Block, SSTableReader};
 use crate::wal::{WalReader, WalWriter};
@@ -8,8 +9,9 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -25,10 +27,15 @@ const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 ///   for calling `flush_wal()` at appropriate intervals (e.g. every N ms or
 ///   every N writes). This is the "Group Commit" strategy used by Postgres and
 ///   RocksDB to reach 150k+ writes/sec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// - `Delayed(interval)`: A background tokio task wakes at `interval` and
+///   flushes the WAL. This is the fully automatic "Group Commit" — writes
+///   return immediately without blocking on I/O, and the background worker
+///   batches all pending data into a single `fsync` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncPolicy {
     EveryWrite,
     Buffered,
+    Delayed(Duration),
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +81,13 @@ pub struct ApexEngine {
     /// needing the VersionSet lock.
     next_lsn: AtomicU64,
     sync_policy: SyncPolicy,
+    /// Engine-wide I/O counters for observability.
+    metrics: Arc<EngineMetrics>,
+    /// Signals the background sync task to shut down gracefully.
+    shutdown: Arc<AtomicBool>,
+    /// Set to true if there is un-synced WAL data in the buffer.
+    /// The background sync task checks this to avoid unnecessary fsync calls.
+    wal_dirty: Arc<AtomicBool>,
 }
 
 impl ApexEngine {
@@ -95,7 +109,6 @@ impl ApexEngine {
 
         // ---- Recover SSTables listed in the MANIFEST ----
         let mut sstables = Vec::new();
-        // Level 0 is the only level in Phase 1
         if let Some(ids) = manifest.levels.get(&0) {
             let mut sorted_ids: Vec<u64> = ids.iter().copied().collect();
             sorted_ids.sort_unstable();
@@ -112,18 +125,16 @@ impl ApexEngine {
         let active_memtable = Arc::new(MemTable::new());
         let mut recovered_lsn: u64 = 0;
 
-        // Find WAL files on disk and replay those with id >= manifest.wal_id
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&data_dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name();
                 let name = fname.to_string_lossy();
-                if let Some(stem) = name.strip_suffix(".wal") {
-                    if let Ok(id) = stem.parse::<u64>() {
-                        if id >= manifest.wal_id {
-                            wal_files.push((id, entry.path()));
-                        }
-                    }
+                if let Some(stem) = name.strip_suffix(".wal")
+                    && let Ok(id) = stem.parse::<u64>()
+                    && id >= manifest.wal_id
+                {
+                    wal_files.push((id, entry.path()));
                 }
             }
         }
@@ -131,24 +142,9 @@ impl ApexEngine {
 
         for (_wal_id, wal_path) in &wal_files {
             let mut reader = WalReader::open(wal_path)?;
-            loop {
-                match reader.next_record() {
-                    Ok(Some(record)) => {
-                        recovered_lsn = recovered_lsn.max(record.lsn + 1);
-                        active_memtable.put(
-                            record.key,
-                            record.value,
-                            record.lsn,
-                        );
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        // Partial/corrupt tail record — expected after a crash.
-                        // Stop replaying this WAL; all fully-written records
-                        // before this point have been recovered.
-                        break;
-                    }
-                }
+            while let Ok(Some(record)) = reader.next_record() {
+                recovered_lsn = recovered_lsn.max(record.lsn + 1);
+                active_memtable.put(record.key, record.value, record.lsn);
             }
         }
 
@@ -163,15 +159,83 @@ impl ApexEngine {
             sstables,
         };
 
+        let metrics = Arc::new(EngineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let wal_dirty = Arc::new(AtomicBool::new(false));
+        let wal_arc = Arc::new(Mutex::new(wal));
+
+        // ---- Spawn background sync task if Delayed ----
+        if let SyncPolicy::Delayed(interval) = &sync_policy {
+            let wal_ref = Arc::clone(&wal_arc);
+            let dirty_ref = Arc::clone(&wal_dirty);
+            let shutdown_ref = Arc::clone(&shutdown);
+            let metrics_ref = Arc::clone(&metrics);
+            let interval = *interval;
+
+            tokio::spawn(async move {
+                Self::background_sync_loop(
+                    wal_ref, dirty_ref, shutdown_ref, metrics_ref, interval,
+                ).await;
+            });
+        }
+
         Ok(Self {
             data_dir,
             version: Arc::new(RwLock::new(version)),
-            wal: Arc::new(Mutex::new(wal)),
+            wal: wal_arc,
             immutable_memtables,
             block_cache,
             next_lsn: AtomicU64::new(recovered_lsn),
             sync_policy,
+            metrics,
+            shutdown,
+            wal_dirty,
         })
+    }
+
+    /// Returns a reference to the engine's I/O metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<EngineMetrics> {
+        &self.metrics
+    }
+
+    // -----------------------------------------------------------------------
+    // Background Sync Worker (for SyncPolicy::Delayed)
+    // -----------------------------------------------------------------------
+
+    /// Wakes at `interval`, checks the dirty flag, and issues a single
+    /// batched `fsync` covering all writes since the last sync.
+    async fn background_sync_loop(
+        wal: Arc<Mutex<WalWriter>>,
+        dirty: Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
+        metrics: Arc<EngineMetrics>,
+        interval: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            // Check if we should shut down
+            if shutdown.load(Ordering::Acquire) {
+                // Final sync before exit
+                if dirty.swap(false, Ordering::AcqRel) {
+                    let mut guard = wal.lock();
+                    let _ = guard.sync();
+                    metrics.record_wal_sync();
+                }
+                return;
+            }
+
+            // Only sync if there is un-flushed data
+            if dirty.swap(false, Ordering::AcqRel) {
+                let mut guard = wal.lock();
+                if let Err(e) = guard.sync() {
+                    eprintln!("Background WAL sync failed: {e:?}");
+                } else {
+                    metrics.record_wal_sync();
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -179,6 +243,7 @@ impl ApexEngine {
     // -----------------------------------------------------------------------
 
     pub fn put(&self, key: Bytes, value: Bytes) -> Result<()> {
+        self.metrics.record_put();
         self.write_internal(key, EntryValue::Value(value))
     }
 
@@ -189,19 +254,33 @@ impl ApexEngine {
     /// Core write path.
     ///
     /// 1. Acquire WAL mutex → append + optional fsync  (disk I/O, no version lock)
-    /// 2. Acquire version write-lock → insert into memtable (nanoseconds, in-memory)
+    /// 2. Acquire version read-lock → insert into memtable (nanoseconds, in-memory)
     /// 3. If memtable is full → rotate (still under version lock, but fast)
     fn write_internal(&self, key: Bytes, value: EntryValue) -> Result<()> {
         // --- Phase 1: WAL I/O (outside version lock) ---
         let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
+        let bytes_written;
 
         {
             let mut wal = self.wal.lock();
-            wal.append(&key, &value)?;
-            if self.sync_policy == SyncPolicy::EveryWrite {
-                wal.sync()?;
+            bytes_written = wal.append(&key, &value)?;
+
+            match &self.sync_policy {
+                SyncPolicy::EveryWrite => {
+                    wal.sync()?;
+                    self.metrics.record_wal_sync();
+                }
+                SyncPolicy::Buffered => {
+                    // Caller is responsible for calling flush_wal()
+                }
+                SyncPolicy::Delayed(_) => {
+                    // Mark dirty — the background task will sync
+                    self.wal_dirty.store(true, Ordering::Release);
+                }
             }
         } // WAL mutex released
+
+        self.metrics.record_wal_write(bytes_written);
 
         // --- Phase 2: MemTable insert (under version lock, nanosecond-fast) ---
         let needs_flush;
@@ -224,7 +303,10 @@ impl ApexEngine {
     /// is a no-op because every append already fsyncs.
     pub fn flush_wal(&self) -> Result<()> {
         let mut wal = self.wal.lock();
-        wal.sync()
+        wal.sync()?;
+        self.metrics.record_wal_sync();
+        self.wal_dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -249,8 +331,8 @@ impl ApexEngine {
             let new_wal = WalWriter::open(&new_wal_path, current_lsn)?;
             {
                 let mut wal_guard = self.wal.lock();
-                // Ensure the old WAL is fully flushed before we swap it out.
                 wal_guard.sync()?;
+                self.metrics.record_wal_sync();
                 *wal_guard = new_wal;
             }
 
@@ -258,7 +340,7 @@ impl ApexEngine {
             let sst_path = self.data_dir.join(format!("{sst_id:06}.sst"));
 
             (old, sst_id, sst_path, new_wal_id)
-        }; // version write-lock released — writers are unblocked
+        }; // version write-lock released
 
         // Spawn background flush
         let block_cache = self.block_cache.clone();
@@ -323,6 +405,8 @@ impl ApexEngine {
     /// Uses only a **shared** (`read`) lock on the version set, so multiple
     /// threads can read concurrently without blocking each other or writers.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.metrics.record_get();
+
         // 1. Active MemTable (under shared lock)
         let version = self.version.read();
         if let Some(val) = version.active_memtable.get(key) {
@@ -353,5 +437,19 @@ impl ApexEngine {
         }
 
         Ok(None)
+    }
+}
+
+/// Graceful shutdown: signal the background sync task and perform a final
+/// WAL flush so no buffered writes are lost on a clean exit.
+impl Drop for ApexEngine {
+    fn drop(&mut self) {
+        // Signal the background sync task to exit
+        self.shutdown.store(true, Ordering::Release);
+
+        // Perform a final synchronous WAL flush
+        if let Some(mut wal) = self.wal.try_lock() {
+            let _ = wal.sync();
+        }
     }
 }
