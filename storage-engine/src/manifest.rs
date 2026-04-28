@@ -147,6 +147,12 @@ impl Manifest {
         // Atomic swap
         std::fs::rename(&temp_path, &self.path)?;
         
+        // Sync parent directory to ensure the rename is durable
+        if let Some(parent) = self.path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+        
         // Re-open the file handle in append mode
         self.file = OpenOptions::new()
             .append(true)

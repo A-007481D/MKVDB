@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{ApexError, Result};
 use crate::manifest::{Manifest, ManifestEvent};
 use std::collections::HashSet;
 use crate::memtable::{EntryValue, ImmutableMemTables, MemTable};
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use parking_lot::Mutex;
 use arc_swap::ArcSwap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,7 +146,7 @@ impl ApexEngine {
 
         for (_wal_id, wal_path) in &wal_files {
             let mut reader = WalReader::open(wal_path)?;
-            while let Ok(Some(record)) = reader.next_record() {
+            while let Some(record) = reader.next_record()? {
                 recovered_lsn = recovered_lsn.max(record.lsn + 1);
                 active_memtable.put(record.key, record.value, record.lsn);
             }
@@ -248,6 +249,9 @@ impl ApexEngine {
                         let _ = std::fs::remove_file(&path);
                     }
                 }
+            } else if name.ends_with(".tmp") {
+                info!("Startup GC: Deleting orphaned temporary file {}", name);
+                let _ = std::fs::remove_file(&path);
             }
         }
         Ok(())
@@ -636,6 +640,86 @@ impl ApexEngine {
     /// Useful for testing and controlled persistence.
     pub fn force_flush(&self) -> Result<()> {
         self.trigger_flush()
+    }
+
+    /// Creates a consistent checkpoint of the database at the given path.
+    /// SSTables and the MANIFEST are hard-linked for efficiency, while the
+    /// active WAL is copied to ensure the checkpoint is immutable.
+    ///
+    /// This is a critical building block for Raft snapshotting.
+    pub fn create_checkpoint<P: AsRef<Path>>(&self, checkpoint_path: P) -> Result<()> {
+        let cp_path = checkpoint_path.as_ref();
+        if cp_path.exists() {
+            return Err(ApexError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Checkpoint path already exists",
+            )));
+        }
+
+        tracing::info!("Creating checkpoint at {:?}", cp_path);
+        std::fs::create_dir_all(cp_path)?;
+
+        // 1. Lock Manifest to get a stable view of active files and WAL ID
+        // We hold the lock during the entire hard-link process to "pin" this version
+        // and prevent the compactor from deleting files we are about to link.
+        let manifest = self.manifest.lock();
+        let wal_id = manifest.wal_id;
+        
+        // Collect all active SST IDs
+        let mut active_ssts = Vec::new();
+        for level_ssts in manifest.levels.values() {
+            for &id in level_ssts {
+                active_ssts.push(id);
+            }
+        }
+
+        // 2. Hard-link SSTables
+        for id in active_ssts {
+            let name = format!("{:06}.sst", id);
+            let src = self.data_dir.join(&name);
+            let dst = cp_path.join(&name);
+            tracing::debug!("Checkpoint: Hard-linking {}", name);
+            std::fs::hard_link(src, dst)?;
+        }
+
+        // 3. Hard-link MANIFEST
+        tracing::debug!("Checkpoint: Hard-linking MANIFEST");
+        std::fs::hard_link(self.data_dir.join("MANIFEST"), cp_path.join("MANIFEST"))?;
+        
+        // Sync parent directory for checkpoint
+        let cp_dir = File::open(cp_path)?;
+        cp_dir.sync_all()?;
+
+        // 4. Copy current WALs
+        // We need all WALs from manifest.wal_id up to the current active WAL.
+        let active_wal_id = self.wal.lock().id;
+        
+        for id in wal_id..=active_wal_id {
+            let name = format!("{:06}.wal", id);
+            let src = self.data_dir.join(&name);
+            let dst = cp_path.join(&name);
+            
+            if !src.exists() {
+                // It's possible some older WALs were already cleaned up if they 
+                // were flushed but the manifest watermark hasn't moved yet?
+                tracing::warn!("Checkpoint: Expected WAL {} not found, skipping", name);
+                continue;
+            }
+
+            tracing::debug!("Checkpoint: Copying/Linking WAL {}", name);
+            if id == active_wal_id {
+                // Active WAL needs a lock and sync
+                let mut wal_guard = self.wal.lock();
+                wal_guard.sync()?;
+                std::fs::copy(src, dst)?;
+            } else {
+                // Old WALs are immutable, can be hard-linked
+                std::fs::hard_link(src, dst)?;
+            }
+        }
+
+        tracing::info!("Checkpoint created successfully at {:?}", cp_path);
+        Ok(())
     }
 }
 
