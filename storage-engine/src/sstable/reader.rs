@@ -3,9 +3,9 @@ use crate::memtable::EntryValue;
 use bloomfilter::Bloom;
 use bytes::Bytes;
 use moka::sync::Cache;
-use parking_lot::Mutex;
-use std::fs::File;
+
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,23 +18,23 @@ pub struct Block {
 
 /// A reader for an on-disk SSTable file.
 ///
-/// The file handle is wrapped in a `Mutex` so that `get()` can take `&self`
-/// instead of `&mut self`. This allows the engine's read path to hold only a
-/// shared (`RwLock::read`) guard on the version set, enabling concurrent reads
-/// across threads. The `moka` block cache is already internally thread-safe.
+/// The file handle is wrapped in an `Arc` so that `get()` can take `&self`
+/// enabling concurrent reads across threads. The `moka` block cache is already thread-safe.
+#[derive(Clone)]
 pub struct SSTableReader {
-    file: Mutex<File>,
-    sparse_index: Vec<(Bytes, u64)>,
-    bloom_filter: Bloom<[u8]>,
-    block_cache: Cache<u64, Arc<Block>>,
+    pub id: u64,
+    pub(crate) file: Arc<std::fs::File>,
+    pub(crate) sparse_index: Vec<(Bytes, u64)>,
+    pub(crate) bloom_filter: Arc<Bloom<[u8]>>,
+    pub(crate) block_cache: Cache<u64, Arc<Block>>,
     /// The byte offset where the sparse index begins in the file.
     /// Used to determine the size of the last data block.
-    index_offset: u64,
+    pub(crate) index_offset: u64,
 }
 
 impl SSTableReader {
-    pub fn open<P: AsRef<Path>>(path: P, block_cache: Cache<u64, Arc<Block>>) -> Result<Self> {
-        let mut file = File::open(path)?;
+    pub fn open<P: AsRef<Path>>(path: P, id: u64, block_cache: Cache<u64, Arc<Block>>) -> Result<Self> {
+        let mut file = std::fs::File::open(path)?;
 
         // Read Footer (24 bytes at the end)
         file.seek(SeekFrom::End(-24))?;
@@ -101,9 +101,10 @@ impl SSTableReader {
             Bloom::from_existing(&bitmap, num_bits, num_hashes, [(k1_0, k1_1), (k2_0, k2_1)]);
 
         Ok(Self {
-            file: Mutex::new(file),
+            id,
+            file: Arc::new(file),
             sparse_index,
-            bloom_filter,
+            bloom_filter: Arc::new(bloom_filter),
             block_cache,
             index_offset,
         })
@@ -115,7 +116,7 @@ impl SSTableReader {
     /// while holding only a shared `RwLock::read` guard on the version set.
     /// File I/O is serialized through an internal `Mutex<File>`, but the hot
     /// path hits the `moka` block cache and never touches the mutex at all.
-    pub fn get(&self, key: &[u8]) -> Result<Option<EntryValue>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<(EntryValue, u64)>> {
         // 1. Bloom Filter Check — zero I/O, zero locking
         if !self.bloom_filter.check(key) {
             return Ok(None);
@@ -144,19 +145,10 @@ impl SSTableReader {
         let block = if let Some(b) = self.block_cache.get(&block_offset) {
             b
         } else {
-            // Cache miss: acquire the file mutex to read from disk
-            let mut file = self.file.lock();
-
-            // Double-check: another thread may have populated the cache while we waited
-            if let Some(b) = self.block_cache.get(&block_offset) {
-                return Ok(Self::search_block(&b, key));
-            }
-
-            file.seek(SeekFrom::Start(block_offset))?;
+            // Cache miss: lock-free read from disk using pread
             let size = (next_offset - block_offset) as usize;
             let mut block_data = vec![0u8; size];
-            file.read_exact(&mut block_data)?;
-            drop(file); // Release file mutex ASAP
+            self.file.read_exact_at(&mut block_data, block_offset)?;
 
             let b = Arc::new(Block {
                 data: Bytes::from(block_data),
@@ -168,8 +160,36 @@ impl SSTableReader {
         Ok(Self::search_block(&block, key))
     }
 
+    /// Fetches a block by its index in the sparse index.
+    pub(crate) fn get_block(&self, block_idx: usize) -> Result<Arc<Block>> {
+        if block_idx >= self.sparse_index.len() {
+            return Err(ApexError::Corruption("Block index out of bounds".into()));
+        }
+        
+        let block_offset = self.sparse_index[block_idx].1;
+        let next_offset = if block_idx + 1 < self.sparse_index.len() {
+            self.sparse_index[block_idx + 1].1
+        } else {
+            self.index_offset
+        };
+
+        if let Some(b) = self.block_cache.get(&block_offset) {
+            Ok(b)
+        } else {
+            let size = (next_offset - block_offset) as usize;
+            let mut block_data = vec![0u8; size];
+            self.file.read_exact_at(&mut block_data, block_offset)?;
+
+            let b = Arc::new(Block {
+                data: Bytes::from(block_data),
+            });
+            self.block_cache.insert(block_offset, Arc::clone(&b));
+            Ok(b)
+        }
+    }
+
     /// Linear scan within a single data block for the target key.
-    fn search_block(block: &Block, key: &[u8]) -> Option<EntryValue> {
+    fn search_block(block: &Block, key: &[u8]) -> Option<(EntryValue, u64)> {
         let mut cursor = 0;
         let data = &block.data;
 
@@ -186,6 +206,12 @@ impl SSTableReader {
             }
             let entry_key = &data[cursor..cursor + key_len];
             cursor += key_len;
+
+            if cursor + 8 > data.len() {
+                break;
+            }
+            let lsn = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
 
             if cursor + 1 > data.len() {
                 break;
@@ -211,7 +237,7 @@ impl SSTableReader {
             };
 
             match entry_key.cmp(key) {
-                std::cmp::Ordering::Equal => return Some(entry_val),
+                std::cmp::Ordering::Equal => return Some((entry_val, lsn)),
                 std::cmp::Ordering::Greater => return None,
                 std::cmp::Ordering::Less => {}
             }

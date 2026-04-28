@@ -25,6 +25,8 @@ pub mod memtable;
 pub mod metrics;
 pub mod sstable;
 pub mod wal;
+pub mod iterator;
+pub mod compaction;
 
 pub use engine::{ApexEngine, SyncPolicy};
 pub use error::{ApexError, Result};
