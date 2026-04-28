@@ -16,3 +16,14 @@ moka = { version = "0.12.5", features = ["sync"] }
 [dev-dependencies]
 proptest = "1.4.0"
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+tokio = { version = "1.36", features = ["full", "test-util"] }
+
+# Criterion benchmark harness
+[[bench]]
+name = "engine_bench"
+harness = false
+
+# Keep debug symbols in release builds for cargo-flamegraph
+[profile.release]
+debug = true
