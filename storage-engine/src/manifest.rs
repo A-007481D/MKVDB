@@ -1,34 +1,47 @@
-use crate::error::{ApexError, Result};
+use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-/// Represents an event that modifies the database's version set.
+/// Represents a version-changing event in the database.
+///
+/// The MANIFEST only records structural changes to the version set (SSTable
+/// additions and removals). It does **not** track per-write sequence numbers —
+/// that responsibility belongs to the WAL, which is the authoritative source
+/// for LSN recovery.
 #[derive(Debug, Clone)]
 pub enum ManifestEvent {
+    /// A new SSTable has been successfully flushed or produced by compaction.
     AddTable { level: u8, id: u64 },
+    /// An SSTable has been removed (consumed by compaction or manual deletion).
     RemoveTable { level: u8, id: u64 },
-    UpdateSeq { seq: u64 },
+    /// Persist the current WAL file id so recovery knows which WALs to replay.
+    SetWalId { wal_id: u64 },
 }
 
 /// The Version Set (Source of Truth).
-/// Tracks active SSTables and the current Log Sequence Number.
+///
+/// Tracks active SSTables and the file-id watermark. Sequence numbers are
+/// recovered from the WAL during startup, not from the MANIFEST.
 pub struct Manifest {
     file: File,
+    #[allow(dead_code)]
     path: PathBuf,
-    
+
     // In-memory state
     pub levels: HashMap<u8, HashSet<u64>>,
-    pub current_seq: u64,
     pub next_file_id: u64,
+    /// The WAL file id that was active when the last flush completed.
+    /// During recovery, any WAL with id >= this value must be replayed.
+    pub wal_id: u64,
 }
 
 impl Manifest {
-    /// Opens an existing MANIFEST file or creates a new one, recovering the state.
+    /// Opens an existing MANIFEST file or creates a new one, recovering state.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -36,10 +49,10 @@ impl Manifest {
             .open(&path)?;
 
         let mut levels = HashMap::new();
-        let mut current_seq = 0;
         let mut next_file_id = 1;
+        let mut wal_id = 0;
 
-        // Recover state
+        // Recover state by replaying the log
         let file_for_read = File::open(&path)?;
         let reader = BufReader::new(file_for_read);
 
@@ -47,7 +60,7 @@ impl Manifest {
             let line = line?;
             if line.is_empty() { continue; }
             let parts: Vec<&str> = line.split(',').collect();
-            
+
             match parts[0] {
                 "ADD" => {
                     if parts.len() == 3 {
@@ -66,9 +79,10 @@ impl Manifest {
                         }
                     }
                 }
-                "SEQ" => {
+                "WAL" => {
                     if parts.len() == 2 {
-                        current_seq = parts[1].parse().unwrap_or(current_seq);
+                        wal_id = parts[1].parse().unwrap_or(wal_id);
+                        next_file_id = next_file_id.max(wal_id + 1);
                     }
                 }
                 _ => {}
@@ -79,23 +93,23 @@ impl Manifest {
             file,
             path,
             levels,
-            current_seq,
             next_file_id,
+            wal_id,
         })
     }
 
     /// Logs an event to the MANIFEST and fsyncs it for crash consistency.
     pub fn log_event(&mut self, event: ManifestEvent) -> Result<()> {
         let line = match &event {
-            ManifestEvent::AddTable { level, id } => format!("ADD,{},{}\n", level, id),
-            ManifestEvent::RemoveTable { level, id } => format!("RM,{},{}\n", level, id),
-            ManifestEvent::UpdateSeq { seq } => format!("SEQ,{}\n", seq),
+            ManifestEvent::AddTable { level, id } => format!("ADD,{level},{id}\n"),
+            ManifestEvent::RemoveTable { level, id } => format!("RM,{level},{id}\n"),
+            ManifestEvent::SetWalId { wal_id } => format!("WAL,{wal_id}\n"),
         };
 
         self.file.write_all(line.as_bytes())?;
         self.file.sync_all()?;
 
-        // Update in-memory state
+        // Mirror into in-memory state
         match event {
             ManifestEvent::AddTable { level, id } => {
                 self.levels.entry(level).or_insert_with(HashSet::new).insert(id);
@@ -106,8 +120,9 @@ impl Manifest {
                     set.remove(&id);
                 }
             }
-            ManifestEvent::UpdateSeq { seq } => {
-                self.current_seq = seq;
+            ManifestEvent::SetWalId { wal_id } => {
+                self.wal_id = wal_id;
+                self.next_file_id = self.next_file_id.max(wal_id + 1);
             }
         }
 
