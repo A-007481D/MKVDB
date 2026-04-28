@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 const BLOCK_SIZE: usize = 4096;
-const MAGIC_NUMBER: u64 = 0x_A9E8_D8_B1_7F_1A_2B_3C;
+const MAGIC_NUMBER: u64 = 0xA9E8_D8B1_7F1A_2B3C;
 
 /// Builds an SSTable from a sequence of sorted key-value pairs.
 pub struct SSTableBuilder {
@@ -122,8 +122,8 @@ impl SSTableBuilder {
         bloom_bytes.extend_from_slice(&sip_keys[1].0.to_le_bytes());
         bloom_bytes.extend_from_slice(&sip_keys[1].1.to_le_bytes());
         
-        bloom_bytes.extend_from_slice(&(self.bloom_filter.number_of_bits() as u64).to_le_bytes());
-        bloom_bytes.extend_from_slice(&(self.bloom_filter.number_of_hash_functions() as u32).to_le_bytes());
+        bloom_bytes.extend_from_slice(&self.bloom_filter.number_of_bits().to_le_bytes());
+        bloom_bytes.extend_from_slice(&self.bloom_filter.number_of_hash_functions().to_le_bytes());
         
         bloom_bytes.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
         bloom_bytes.extend_from_slice(&bitmap);
@@ -138,7 +138,7 @@ impl SSTableBuilder {
 
         self.writer.flush()?;
         // The file handle is flushed but we also want an fsync on the SSTable
-        self.writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        self.writer.into_inner().map_err(std::io::IntoInnerError::into_error)?.sync_all()?;
         Ok(())
     }
 }

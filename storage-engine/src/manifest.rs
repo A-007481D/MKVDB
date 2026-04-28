@@ -48,7 +48,7 @@ impl Manifest {
             .read(true)
             .open(&path)?;
 
-        let mut levels = HashMap::new();
+        let mut levels: HashMap<u8, HashSet<u64>> = HashMap::new();
         let mut next_file_id = 1;
         let mut wal_id = 0;
 
@@ -62,28 +62,22 @@ impl Manifest {
             let parts: Vec<&str> = line.split(',').collect();
 
             match parts[0] {
-                "ADD" => {
-                    if parts.len() == 3 {
-                        let level: u8 = parts[1].parse().unwrap_or(0);
-                        let id: u64 = parts[2].parse().unwrap_or(0);
-                        levels.entry(level).or_insert_with(HashSet::new).insert(id);
-                        next_file_id = next_file_id.max(id + 1);
+                "ADD" if parts.len() == 3 => {
+                    let level: u8 = parts[1].parse().unwrap_or(0);
+                    let id: u64 = parts[2].parse().unwrap_or(0);
+                    levels.entry(level).or_default().insert(id);
+                    next_file_id = next_file_id.max(id + 1);
+                }
+                "RM" if parts.len() == 3 => {
+                    let level: u8 = parts[1].parse().unwrap_or(0);
+                    let id: u64 = parts[2].parse().unwrap_or(0);
+                    if let Some(set) = levels.get_mut(&level) {
+                        set.remove(&id);
                     }
                 }
-                "RM" => {
-                    if parts.len() == 3 {
-                        let level: u8 = parts[1].parse().unwrap_or(0);
-                        let id: u64 = parts[2].parse().unwrap_or(0);
-                        if let Some(set) = levels.get_mut(&level) {
-                            set.remove(&id);
-                        }
-                    }
-                }
-                "WAL" => {
-                    if parts.len() == 2 {
-                        wal_id = parts[1].parse().unwrap_or(wal_id);
-                        next_file_id = next_file_id.max(wal_id + 1);
-                    }
+                "WAL" if parts.len() == 2 => {
+                    wal_id = parts[1].parse().unwrap_or(wal_id);
+                    next_file_id = next_file_id.max(wal_id + 1);
                 }
                 _ => {}
             }
@@ -112,7 +106,7 @@ impl Manifest {
         // Mirror into in-memory state
         match event {
             ManifestEvent::AddTable { level, id } => {
-                self.levels.entry(level).or_insert_with(HashSet::new).insert(id);
+                self.levels.entry(level).or_default().insert(id);
                 self.next_file_id = self.next_file_id.max(id + 1);
             }
             ManifestEvent::RemoveTable { level, id } => {

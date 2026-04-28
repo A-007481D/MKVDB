@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-const MAGIC_NUMBER: u64 = 0x_A9E8_D8_B1_7F_1A_2B_3C;
+const MAGIC_NUMBER: u64 = 0xA9E8_D8B1_7F1A_2B3C;
 
 #[derive(Clone)]
 pub struct Block {
@@ -143,7 +143,7 @@ impl SSTableReader {
             
             // Double-check: another thread may have populated the cache while we waited
             if let Some(b) = self.block_cache.get(&block_offset) {
-                return Self::search_block(&b, key);
+                return Ok(Self::search_block(&b, key));
             }
 
             file.seek(SeekFrom::Start(block_offset))?;
@@ -157,11 +157,11 @@ impl SSTableReader {
             b
         };
 
-        Self::search_block(&block, key)
+        Ok(Self::search_block(&block, key))
     }
 
     /// Linear scan within a single data block for the target key.
-    fn search_block(block: &Block, key: &[u8]) -> Result<Option<EntryValue>> {
+    fn search_block(block: &Block, key: &[u8]) -> Option<EntryValue> {
         let mut cursor = 0;
         let data = &block.data;
 
@@ -193,12 +193,12 @@ impl SSTableReader {
             };
 
             match entry_key.cmp(key) {
-                std::cmp::Ordering::Equal => return Ok(Some(entry_val)),
-                std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Equal => return Some(entry_val),
+                std::cmp::Ordering::Greater => return None,
                 std::cmp::Ordering::Less => {}
             }
         }
 
-        Ok(None)
+        None
     }
 }
