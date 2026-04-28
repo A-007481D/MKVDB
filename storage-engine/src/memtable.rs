@@ -28,7 +28,7 @@ impl EntryValue {
 
 /// A highly concurrent, lock-free Memory Table based on a SkipList.
 pub struct MemTable {
-    map: SkipMap<Bytes, EntryValue>,
+    pub(crate) map: SkipMap<Bytes, (EntryValue, u64)>,
     approximate_size: AtomicUsize,
     /// The lowest sequence number contained in this memtable.
     first_seq: std::sync::atomic::AtomicU64,
@@ -65,9 +65,9 @@ impl MemTable {
         // is approximate, so we just add the new sizes. For strict limits, we might
         // want to subtract the old size if we can efficiently find it.
         // For LSM memtables, usually we just accumulate and flush when total written hits a threshold.
-        let added_size = key_len + val_len;
+        let added_size = key_len + val_len + 8; // +8 for LSN
 
-        self.map.insert(key, value);
+        self.map.insert(key, (value, seq));
         self.approximate_size
             .fetch_add(added_size, Ordering::Relaxed);
 
@@ -79,7 +79,7 @@ impl MemTable {
     /// Retrieves a value by key.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<EntryValue> {
-        self.map.get(key).map(|e| e.value().clone())
+        self.map.get(key).map(|e| e.value().0.clone())
     }
 
     /// Returns the approximate memory footprint in bytes.
@@ -98,7 +98,7 @@ impl MemTable {
     }
 
     /// Returns an iterator over the entries in the memtable.
-    pub fn iter(&self) -> crossbeam_skiplist::map::Iter<'_, Bytes, EntryValue> {
+    pub fn iter(&self) -> crossbeam_skiplist::map::Iter<'_, Bytes, (EntryValue, u64)> {
         self.map.iter()
     }
 }

@@ -41,12 +41,13 @@ impl SSTableBuilder {
 
     /// Adds a key-value pair to the SSTable.
     /// MUST be called with strictly monotonically increasing keys.
-    pub fn add(&mut self, key: &[u8], value: &EntryValue) -> Result<()> {
+    pub fn add(&mut self, key: &[u8], value: &EntryValue, lsn: u64) -> Result<()> {
         let mut entry_bytes = Vec::new();
 
-        // [KeyLen(4)][Key][IsTombstone(1)][ValLen(4)][Value]
+        // [KeyLen(4)][Key][LSN(8)][IsTombstone(1)][ValLen(4)][Value]
         entry_bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
         entry_bytes.extend_from_slice(key);
+        entry_bytes.extend_from_slice(&lsn.to_le_bytes());
 
         match value {
             EntryValue::Value(v) => {
@@ -79,6 +80,11 @@ impl SSTableBuilder {
         self.keys_written += 1;
 
         Ok(())
+    }
+
+    /// Returns the approximate size of the data written so far.
+    pub fn estimated_size(&self) -> u64 {
+        self.current_offset + self.current_block.len() as u64
     }
 
     fn flush_current_block(&mut self) -> Result<()> {

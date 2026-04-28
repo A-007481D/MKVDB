@@ -7,11 +7,14 @@ use crate::sstable::reader::{Block, SSTableReader};
 use crate::wal::{WalReader, WalWriter};
 use bytes::Bytes;
 use moka::sync::Cache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+use arc_swap::ArcSwap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use crate::iterator::{DbIterator, MemTableIterator, MergingIterator};
+use crate::sstable::iterator::SSTableIterator;
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -39,17 +42,15 @@ pub enum SyncPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Version Set — the subset of state protected by RwLock
+// Version — the immutable structural view of the database
 // ---------------------------------------------------------------------------
 
-/// The "version set": the structural view of the database that readers need.
+/// The "version": the structural view of the database that readers need.
 ///
-/// Protected by an `RwLock`. Readers hold a shared guard; only structural
-/// mutations (memtable rotation, SSTable list changes) take a write guard.
-pub struct VersionSet {
+/// Managed via `ArcSwap` for lock-free lock-stripping.
+pub struct Version {
     pub active_memtable: Arc<MemTable>,
-    pub manifest: Manifest,
-    pub sstables: Vec<SSTableReader>,
+    pub sstables: Vec<Arc<SSTableReader>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,20 +72,21 @@ pub struct VersionSet {
 /// `VersionSet` write-lock. The lock is only held for the nanosecond-fast
 /// in-memory memtable insert + size check.
 pub struct ApexEngine {
-    data_dir: PathBuf,
-    version: Arc<RwLock<VersionSet>>,
-    wal: Arc<Mutex<WalWriter>>,
-    immutable_memtables: Arc<ImmutableMemTables>,
-    block_cache: Cache<u64, Arc<Block>>,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) version: Arc<ArcSwap<Version>>,
+    pub(crate) manifest: Arc<Mutex<Manifest>>,
+    pub(crate) wal: Arc<Mutex<WalWriter>>,
+    pub(crate) immutable_memtables: Arc<ImmutableMemTables>,
+    pub(crate) block_cache: Cache<u64, Arc<Block>>,
     /// Monotonically increasing sequence number. Atomic so the WAL append
     /// (under Mutex) and the memtable insert can share the value without
     /// needing the VersionSet lock.
-    next_lsn: AtomicU64,
-    sync_policy: SyncPolicy,
+    pub(crate) next_lsn: AtomicU64,
+    pub(crate) sync_policy: SyncPolicy,
     /// Engine-wide I/O counters for observability.
-    metrics: Arc<EngineMetrics>,
+    pub(crate) metrics: Arc<EngineMetrics>,
     /// Signals the background sync task to shut down gracefully.
-    shutdown: Arc<AtomicBool>,
+    pub(crate) shutdown: Arc<AtomicBool>,
     /// Set to true if there is un-synced WAL data in the buffer.
     /// The background sync task checks this to avoid unnecessary fsync calls.
     wal_dirty: Arc<AtomicBool>,
@@ -115,8 +117,8 @@ impl ApexEngine {
             for id in sorted_ids {
                 let sst_path = data_dir.join(format!("{id:06}.sst"));
                 if sst_path.exists() {
-                    let reader = SSTableReader::open(&sst_path, block_cache.clone())?;
-                    sstables.push(reader);
+                    let reader = SSTableReader::open(&sst_path, id, block_cache.clone())?;
+                    sstables.push(Arc::new(reader));
                 }
             }
         }
@@ -153,9 +155,8 @@ impl ApexEngine {
         let wal_path = data_dir.join(format!("{wal_id:06}.wal"));
         let wal = WalWriter::open(&wal_path, recovered_lsn)?;
 
-        let version = VersionSet {
+        let version = Version {
             active_memtable,
-            manifest,
             sstables,
         };
 
@@ -163,6 +164,7 @@ impl ApexEngine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let wal_dirty = Arc::new(AtomicBool::new(false));
         let wal_arc = Arc::new(Mutex::new(wal));
+        let manifest_arc = Arc::new(Mutex::new(manifest));
 
         // ---- Spawn background sync task if Delayed ----
         if let SyncPolicy::Delayed(interval) = &sync_policy {
@@ -180,7 +182,8 @@ impl ApexEngine {
 
         Ok(Self {
             data_dir,
-            version: Arc::new(RwLock::new(version)),
+            version: Arc::new(ArcSwap::from_pointee(version)),
+            manifest: manifest_arc,
             wal: wal_arc,
             immutable_memtables,
             block_cache,
@@ -281,13 +284,13 @@ impl ApexEngine {
 
         self.metrics.record_wal_write(bytes_written);
 
-        // --- Phase 2: MemTable insert (under version lock, nanosecond-fast) ---
+        // --- Phase 2: MemTable insert (lock-free) ---
         let needs_flush;
         {
-            let version = self.version.read();
+            let version = self.version.load();
             version.active_memtable.put(key, value, lsn);
             needs_flush = version.active_memtable.size() >= MEMTABLE_SIZE_LIMIT;
-        } // version read-lock released
+        } // version guard released
 
         if needs_flush {
             self.trigger_flush()?;
@@ -314,14 +317,14 @@ impl ApexEngine {
 
     fn trigger_flush(&self) -> Result<()> {
         let (old_memtable, sst_id, sst_path, wal_id) = {
-            let mut version = self.version.write();
+            let mut manifest = self.manifest.lock();
 
-            // Rotate memtable
-            let old = std::mem::replace(&mut version.active_memtable, Arc::new(MemTable::new()));
+            // Rotate memtable & create new version
+            let old = self.version.load().active_memtable.clone();
             self.immutable_memtables.push(Arc::clone(&old));
 
             // Rotate WAL
-            let new_wal_id = version.manifest.generate_file_id();
+            let new_wal_id = manifest.generate_file_id();
             let new_wal_path = self.data_dir.join(format!("{new_wal_id:06}.wal"));
             let current_lsn = self.next_lsn.load(Ordering::Relaxed);
             let new_wal = WalWriter::open(&new_wal_path, current_lsn)?;
@@ -332,16 +335,24 @@ impl ApexEngine {
                 *wal_guard = new_wal;
             }
 
-            let sst_id = version.manifest.generate_file_id();
+            let sst_id = manifest.generate_file_id();
             let sst_path = self.data_dir.join(format!("{sst_id:06}.sst"));
 
+            let current_version = self.version.load();
+            let new_version = Version {
+                active_memtable: Arc::new(MemTable::new()),
+                sstables: current_version.sstables.clone(),
+            };
+            self.version.store(Arc::new(new_version));
+
             (old, sst_id, sst_path, new_wal_id)
-        }; // version write-lock released
+        }; // manifest lock released
 
         // Spawn background flush
         let block_cache = self.block_cache.clone();
         let imm_queue = Arc::clone(&self.immutable_memtables);
-        let version_lock = Arc::clone(&self.version);
+        let version_arc = Arc::clone(&self.version);
+        let manifest_arc = Arc::clone(&self.manifest);
 
         tokio::spawn(async move {
             if let Err(e) = Self::flush_memtable(
@@ -351,7 +362,8 @@ impl ApexEngine {
                 old_memtable,
                 block_cache,
                 imm_queue,
-                version_lock,
+                version_arc,
+                manifest_arc,
             ) {
                 eprintln!("Background flush failed: {e:?}");
             }
@@ -372,29 +384,46 @@ impl ApexEngine {
         memtable: Arc<MemTable>,
         block_cache: Cache<u64, Arc<Block>>,
         immutable_queue: Arc<ImmutableMemTables>,
-        version_lock: Arc<RwLock<VersionSet>>,
+        version_arc: Arc<ArcSwap<Version>>,
+        manifest_arc: Arc<Mutex<Manifest>>,
     ) -> Result<()> {
         // 1. Build SSTable on disk (no locks held)
         let mut builder = SSTableBuilder::new(&sst_path, 10_000)?;
         for entry in memtable.iter() {
-            builder.add(entry.key().as_ref(), entry.value())?;
+            builder.add(entry.key().as_ref(), &entry.value().0, entry.value().1)?;
         }
         builder.finish()?;
 
-        // 2. Update version set (short write-lock)
-        let mut version = version_lock.write();
-        let reader = SSTableReader::open(&sst_path, block_cache)?;
-        version.sstables.push(reader);
+        // 2. Update version set (lock-free swap via ArcSwap)
+        let reader = SSTableReader::open(&sst_path, sst_id, block_cache)?;
+        
+        // We use a simple loop for compare-and-swap if another thread (e.g. compaction) 
+        // updated the version in the meantime.
+        let mut current_version = version_arc.load();
+        loop {
+            let mut new_sstables = current_version.sstables.clone();
+            new_sstables.push(Arc::new(reader.clone())); // reader cloning is cheap thanks to Arc inside
+
+            let new_version = Arc::new(Version {
+                active_memtable: Arc::clone(&current_version.active_memtable),
+                sstables: new_sstables,
+            });
+
+            let prev = version_arc.compare_and_swap(&current_version, new_version);
+            if Arc::ptr_eq(&prev, &current_version) {
+                break;
+            }
+            current_version = prev;
+        }
 
         // 3. MANIFEST is the LAST step — atomic commitment point
-        version.manifest.log_event(ManifestEvent::AddTable {
+        let mut manifest = manifest_arc.lock();
+        manifest.log_event(ManifestEvent::AddTable {
             level: 0,
             id: sst_id,
         })?;
-        version
-            .manifest
-            .log_event(ManifestEvent::SetWalId { wal_id })?;
-        drop(version);
+        manifest.log_event(ManifestEvent::SetWalId { wal_id })?;
+        drop(manifest);
 
         // 4. Remove from immutable queue (safe: MANIFEST already persisted)
         immutable_queue.remove_flushed(memtable);
@@ -413,15 +442,14 @@ impl ApexEngine {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.metrics.record_get();
 
-        // 1. Active MemTable (under shared lock)
-        let version = self.version.read();
+        // 1. Active MemTable (lock-free)
+        let version = self.version.load();
         if let Some(val) = version.active_memtable.get(key) {
             return match val {
                 EntryValue::Value(v) => Ok(Some(v)),
                 EntryValue::Tombstone => Ok(None),
             };
         }
-        drop(version);
 
         // 2. Immutable MemTables (own internal RwLock)
         if let Some(val) = self.immutable_memtables.get(key) {
@@ -431,10 +459,9 @@ impl ApexEngine {
             };
         }
 
-        // 3. SSTables (shared lock — SSTableReader::get takes &self)
-        let version = self.version.read();
+        // 3. SSTables (lock-free)
         for reader in version.sstables.iter().rev() {
-            if let Some(val) = reader.get(key)? {
+            if let Some((val, _lsn)) = reader.get(key)? {
                 return match val {
                     EntryValue::Value(v) => Ok(Some(v)),
                     EntryValue::Tombstone => Ok(None),
@@ -442,6 +469,72 @@ impl ApexEngine {
             }
         }
 
+        Ok(None)
+    }
+
+    /// Performs a range scan, returning an iterator over `(Key, Value)`.
+    /// Tombstones are automatically filtered out.
+    pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanIterator> {
+        let mut iterators: Vec<Box<dyn DbIterator>> = Vec::new();
+
+        let version = self.version.load();
+
+        // Active MemTable
+        iterators.push(Box::new(MemTableIterator::new(version.active_memtable.clone())));
+
+        // Immutable MemTables
+        for imm in self.immutable_memtables.snapshot() {
+            iterators.push(Box::new(MemTableIterator::new(imm)));
+        }
+
+        // SSTables
+        for sst in &version.sstables {
+            // Optimization: check if SSTable overlaps with range via sparse index / min/max keys.
+            // For now, add all of them. The block cache makes it cheap if they are heavily used.
+            iterators.push(Box::new(SSTableIterator::new(Arc::clone(sst))?));
+        }
+
+        let mut merging_iter = MergingIterator::new(iterators)?;
+
+        // Seek all iterators to start_key? 
+        // Wait, DbIterator doesn't have a `seek()` method yet!
+        // For now, we will scan and skip until >= start_key.
+        // In a real system, we must add `seek(key)` to DbIterator.
+        
+        while merging_iter.is_valid() && merging_iter.key().as_ref() < start_key.as_ref() {
+            merging_iter.next()?;
+        }
+
+        Ok(ScanIterator {
+            iter: merging_iter,
+            end_key,
+        })
+    }
+}
+
+pub struct ScanIterator {
+    iter: MergingIterator,
+    end_key: Bytes,
+}
+
+impl ScanIterator {
+    pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        while self.iter.is_valid() {
+            let key = self.iter.key();
+            if key.as_ref() > self.end_key.as_ref() {
+                break;
+            }
+
+            let val = self.iter.value();
+            let is_tombstone = val.is_tombstone();
+            let v_bytes = val.as_bytes().to_vec();
+            
+            self.iter.next()?;
+
+            if !is_tombstone {
+                return Ok(Some((key, Bytes::from(v_bytes))));
+            }
+        }
         Ok(None)
     }
 }
