@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use crate::iterator::{DbIterator, MemTableIterator, MergingIterator, ScanStream};
 use crate::sstable::iterator::SSTableIterator;
+use tracing::{info, error};
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -243,6 +244,12 @@ impl ApexEngine {
         }
     }
 
+    /// Returns true if the engine is overwhelmed with pending flushes.
+    /// Used for network backpressure to slow down producers.
+    pub fn is_saturated(&self) -> bool {
+        self.immutable_memtables.len() >= 5
+    }
+
     // -----------------------------------------------------------------------
     // Background Sync Worker (for SyncPolicy::Delayed)
     // -----------------------------------------------------------------------
@@ -414,7 +421,9 @@ impl ApexEngine {
                 version_arc,
                 manifest_arc,
             ) {
-                eprintln!("Background flush failed: {e:?}");
+                error!("Background flush failed for SSTable {}: {:?}", sst_id, e);
+            } else {
+                info!("Successfully flushed SSTable {}", sst_id);
             }
         });
 

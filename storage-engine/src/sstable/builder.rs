@@ -92,8 +92,13 @@ impl SSTableBuilder {
             return Ok(());
         }
 
+        // Calculate CRC32 checksum for the block
+        let checksum = crc32fast::hash(&self.current_block);
+
         self.writer.write_all(&self.current_block)?;
-        self.current_offset += self.current_block.len() as u64;
+        self.writer.write_all(&checksum.to_le_bytes())?; // 4-byte checksum footer
+
+        self.current_offset += (self.current_block.len() + 4) as u64;
         self.current_block.clear();
         Ok(())
     }

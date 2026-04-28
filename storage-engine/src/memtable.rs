@@ -122,6 +122,10 @@ impl ImmutableMemTables {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.queue.read().len()
+    }
+
     pub fn push(&self, table: Arc<MemTable>) {
         self.queue.write().push(table);
     }
