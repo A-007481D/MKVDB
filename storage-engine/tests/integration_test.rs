@@ -49,7 +49,10 @@ fn test_crash_recovery_via_wal_replay() {
         let engine = ApexEngine::open(dir.path()).unwrap();
         let result1 = engine.get(&key1).unwrap();
         let result2 = engine.get(&key2).unwrap();
-        assert_eq!(result1, None, "k1 was deleted; should not reappear after recovery");
+        assert_eq!(
+            result1, None,
+            "k1 was deleted; should not reappear after recovery"
+        );
         assert_eq!(result2, Some(val2), "k2 must survive recovery");
     }
 }
@@ -69,7 +72,11 @@ fn test_overwrite_survives_recovery() {
     {
         let engine = ApexEngine::open(dir.path()).unwrap();
         let val = engine.get(&key).unwrap();
-        assert_eq!(val, Some(Bytes::from("3")), "latest overwrite must win after recovery");
+        assert_eq!(
+            val,
+            Some(Bytes::from("3")),
+            "latest overwrite must win after recovery"
+        );
     }
 }
 
