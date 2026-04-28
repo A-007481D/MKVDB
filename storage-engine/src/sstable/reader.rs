@@ -144,22 +144,8 @@ impl SSTableReader {
             self.index_offset
         };
 
-        // 3. Block Cache lookup — thread-safe, no file mutex needed
-        let cache_key = (self.id, block_offset);
-        let block = if let Some(b) = self.block_cache.get(&cache_key) {
-            b
-        } else {
-            // Cache miss: lock-free read from disk using pread
-            let size = (next_offset - block_offset) as usize;
-            let mut block_data = vec![0u8; size];
-            self.table_cache.get_file(self.id)?.read_exact_at(&mut block_data, block_offset)?;
- 
-            let b = Arc::new(Block {
-                data: Bytes::from(block_data),
-            });
-            self.block_cache.insert(cache_key, Arc::clone(&b));
-            b
-        };
+        // 3. Block Cache lookup & verification
+        let block = self.get_block(block_idx)?;
 
         Ok(Self::search_block(&block, key))
     }
