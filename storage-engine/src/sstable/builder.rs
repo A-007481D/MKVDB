@@ -4,13 +4,15 @@ use bloomfilter::Bloom;
 use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const BLOCK_SIZE: usize = 4096;
 const MAGIC_NUMBER: u64 = 0xA9E8_D8B1_7F1A_2B3C;
 
 /// Builds an SSTable from a sequence of sorted key-value pairs.
 pub struct SSTableBuilder {
+    target_path: PathBuf,
+    temp_path: PathBuf,
     writer: BufWriter<File>,
     current_block: Vec<u8>,
     sparse_index: Vec<(Bytes, u64)>, // (First key of block, Block offset)
@@ -21,15 +23,20 @@ pub struct SSTableBuilder {
 
 impl SSTableBuilder {
     pub fn new<P: AsRef<Path>>(path: P, expected_keys: usize) -> Result<Self> {
+        let target_path = path.as_ref().to_path_buf();
+        let temp_path = target_path.with_extension("tmp");
+        
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(path)?;
+            .open(&temp_path)?;
 
         let bloom = Bloom::new_for_fp_rate(expected_keys.max(100), 0.01);
 
         Ok(Self {
+            target_path,
+            temp_path,
             writer: BufWriter::new(file),
             current_block: Vec::with_capacity(BLOCK_SIZE),
             sparse_index: Vec::new(),
@@ -83,6 +90,7 @@ impl SSTableBuilder {
     }
 
     /// Returns the approximate size of the data written so far.
+    #[must_use]
     pub fn estimated_size(&self) -> u64 {
         self.current_offset + self.current_block.len() as u64
     }
@@ -92,13 +100,16 @@ impl SSTableBuilder {
             return Ok(());
         }
 
-        // Calculate CRC32 checksum for the block
-        let checksum = crc32fast::hash(&self.current_block);
+        // Compress the block
+        let compressed_block = lz4_flex::compress_prepend_size(&self.current_block);
 
-        self.writer.write_all(&self.current_block)?;
+        // Calculate CRC32 checksum for the COMPRESSED block
+        let checksum = crc32fast::hash(&compressed_block);
+
+        self.writer.write_all(&compressed_block)?;
         self.writer.write_all(&checksum.to_le_bytes())?; // 4-byte checksum footer
 
-        self.current_offset += (self.current_block.len() + 4) as u64;
+        self.current_offset += (compressed_block.len() + 4) as u64;
         self.current_block.clear();
         Ok(())
     }
@@ -156,6 +167,16 @@ impl SSTableBuilder {
             .into_inner()
             .map_err(std::io::IntoInnerError::into_error)?
             .sync_all()?;
+
+        // Atomic Rename: Only move the file to its final destination after it's fully synced.
+        std::fs::rename(&self.temp_path, &self.target_path)?;
+
+        // Sync parent directory to ensure the rename is durable
+        if let Some(parent) = self.target_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+        
         Ok(())
     }
 }

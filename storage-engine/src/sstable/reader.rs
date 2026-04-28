@@ -164,7 +164,7 @@ impl SSTableReader {
             return Ok(b);
         }
 
-        // The block on disk is [data][checksum(4)]
+        // The block on disk is [compressed_data][checksum(4)]
         let full_size = (next_block_offset - block_offset) as usize;
         if full_size < 4 {
             return Err(ApexError::Corruption(format!(
@@ -177,9 +177,9 @@ impl SSTableReader {
         let file = self.table_cache.get_file(self.id)?;
         file.read_exact_at(&mut buf, block_offset)?;
 
-        let (data, checksum_bytes) = buf.split_at(full_size - 4);
+        let (compressed_data, checksum_bytes) = buf.split_at(full_size - 4);
         let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().unwrap());
-        let actual_checksum = crc32fast::hash(data);
+        let actual_checksum = crc32fast::hash(compressed_data);
 
         if actual_checksum != expected_checksum {
             return Err(ApexError::Corruption(format!(
@@ -188,8 +188,12 @@ impl SSTableReader {
             )));
         }
 
+        // Decompress the block
+        let decompressed_data = lz4_flex::decompress_size_prepended(compressed_data)
+            .map_err(|e| ApexError::Corruption(format!("Lz4 decompression failed: {e}")))?;
+
         let b = Arc::new(Block {
-            data: Bytes::copy_from_slice(data),
+            data: Bytes::from(decompressed_data),
         });
         self.block_cache.insert(cache_key, Arc::clone(&b));
         Ok(b)

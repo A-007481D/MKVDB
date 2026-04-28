@@ -56,11 +56,19 @@ impl ApexServer {
             }
 
             let request = request?;
+            tracing::debug!("Received request: {:?}", request);
+
             let response = match request {
                 RespValue::Array(Some(mut args)) if !args.is_empty() => {
                     Self::dispatch_command(&engine, &mut args).await
                 }
-                _ => RespValue::Error("ERR unknown command or invalid format".to_string()),
+                RespValue::SimpleString(s) if s.to_uppercase() == "PING" => {
+                    RespValue::SimpleString("PONG".to_string())
+                }
+                _ => {
+                    tracing::warn!("Received invalid request format: {:?}", request);
+                    RespValue::Error("ERR unknown command or invalid format".to_string())
+                }
             };
 
             framed.send(response).await?;
@@ -92,7 +100,7 @@ impl ApexServer {
 
                 match engine.put(key, val).await {
                     Ok(_) => RespValue::SimpleString("OK".to_string()),
-                    Err(e) => RespValue::Error(format!("ERR storage error: {:?}", e)),
+                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
                 }
             }
             "GET" => {
@@ -107,7 +115,7 @@ impl ApexServer {
                 match engine.get(key) {
                     Ok(Some(val)) => RespValue::BulkString(Some(val)),
                     Ok(None) => RespValue::BulkString(None), // Nil
-                    Err(e) => RespValue::Error(format!("ERR storage error: {:?}", e)),
+                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
                 }
             }
             "DEL" => {
@@ -121,7 +129,7 @@ impl ApexServer {
 
                 match engine.delete(key).await {
                     Ok(_) => RespValue::Integer(1),
-                    Err(e) => RespValue::Error(format!("ERR storage error: {:?}", e)),
+                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
                 }
             }
             "SCAN" => {
@@ -147,16 +155,18 @@ impl ApexServer {
                                     results.push(RespValue::BulkString(Some(k)));
                                     results.push(RespValue::BulkString(Some(v)));
                                 }
-                                Err(e) => return RespValue::Error(format!("ERR scan error: {:?}", e)),
+                                Err(e) => return RespValue::Error(format!("ERR scan error: {e:?}")),
                             }
                         }
                         RespValue::Array(Some(results))
                     }
-                    Err(e) => RespValue::Error(format!("ERR scan error: {:?}", e)),
+                    Err(e) => RespValue::Error(format!("ERR scan error: {e:?}")),
                 }
             }
             "PING" => RespValue::SimpleString("PONG".to_string()),
-            _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
+            "COMMAND" | "HELLO" => RespValue::Array(Some(vec![])),
+            "CLIENT" => RespValue::SimpleString("OK".to_string()),
+            _ => RespValue::Error(format!("ERR unknown command '{cmd_name}'")),
         }
     }
 }

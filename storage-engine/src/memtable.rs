@@ -122,8 +122,14 @@ impl ImmutableMemTables {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.queue.read().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.read().is_empty()
     }
 
     pub fn push(&self, table: Arc<MemTable>) {

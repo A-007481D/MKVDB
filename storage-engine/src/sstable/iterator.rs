@@ -100,13 +100,37 @@ impl DbIterator for SSTableIterator {
                 self.cursor = cursor;
                 self.current_entry = Some((entry_key, entry_val, lsn));
                 return Ok(true);
-            } else {
-                self.current_entry = None;
-                return Ok(false);
-            }
+            } 
+            
+            self.current_entry = None;
+            return Ok(false);
         }
         
         self.current_entry = None;
+        Ok(false)
+    }
+
+    fn seek(&mut self, target: &[u8]) -> Result<bool> {
+        // 1. Binary search the sparse index to find the best candidate block
+        self.block_idx = match self.reader.sparse_index.binary_search_by(|(k, _)| k.as_ref().cmp(target)) {
+            Ok(idx) => idx,
+            Err(0) => 0,
+            Err(idx) => idx - 1,
+        };
+
+        if !self.load_block()? {
+            self.current_entry = None;
+            return Ok(false);
+        }
+
+        // 2. Iterate until we find the first key >= target
+        // (next() handles moving across blocks if needed)
+        while self.next()? {
+            if self.key().as_ref() >= target {
+                return Ok(true);
+            }
+        }
+
         Ok(false)
     }
 

@@ -14,6 +14,9 @@ use std::sync::Arc;
 pub trait DbIterator: Send {
     /// Advance to the next element. Returns true if the new position is valid.
     fn next(&mut self) -> Result<bool>;
+
+    /// Seek to the first key >= `target`. Returns true if valid.
+    fn seek(&mut self, target: &[u8]) -> Result<bool>;
     
     /// Returns the current key. Panics if !is_valid().
     fn key(&self) -> Bytes;
@@ -64,6 +67,18 @@ impl DbIterator for MemTableIterator {
         if let Some(entry) = next_entry {
             let (val, lsn) = entry.value();
             self.current = Some((entry.key().clone(), val.clone(), *lsn));
+            Ok(true)
+        } else {
+            self.current = None;
+            Ok(false)
+        }
+    }
+
+    fn seek(&mut self, target: &[u8]) -> Result<bool> {
+        let entry = self.memtable.map.lower_bound(std::ops::Bound::Included(target));
+        if let Some(e) = entry {
+            let (val, lsn) = e.value();
+            self.current = Some((e.key().clone(), val.clone(), *lsn));
             Ok(true)
         } else {
             self.current = None;
@@ -201,6 +216,24 @@ impl DbIterator for MergingIterator {
         Ok(self.is_valid())
     }
 
+    fn seek(&mut self, target: &[u8]) -> Result<bool> {
+        self.heap.clear();
+        self.current_idx = None;
+
+        for (i, iter) in self.iterators.iter_mut().enumerate() {
+            if iter.seek(target)? {
+                self.heap.push(HeapElement {
+                    iter_idx: i,
+                    key: iter.key(),
+                    lsn: iter.lsn(),
+                });
+            }
+        }
+
+        self.advance()?;
+        Ok(self.is_valid())
+    }
+
     fn key(&self) -> Bytes {
         self.iterators[self.current_idx.unwrap()].key()
     }
@@ -254,10 +287,9 @@ impl Stream for ScanStream {
             let key = self.merger.key();
 
             // Check range bounds (Inclusive)
-            if let Some(end) = &self.end_key {
-                if key.as_ref() > end.as_ref() {
-                    return Poll::Ready(None);
-                }
+            if let Some(end) = &self.end_key
+                && key.as_ref() > end.as_ref() {
+                return Poll::Ready(None);
             }
 
             let value = self.merger.value();
@@ -268,10 +300,10 @@ impl Stream for ScanStream {
             }
 
             // Filter out tombstones and yield values
-            match value {
-                EntryValue::Value(v) => return Poll::Ready(Some(Ok((key, v)))),
-                EntryValue::Tombstone => continue, // Skip and check next element
+            if let EntryValue::Value(v) = value {
+                return Poll::Ready(Some(Ok((key, v))));
             }
+            // Skip tombstones and check next element
         }
     }
 }

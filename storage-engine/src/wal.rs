@@ -16,6 +16,7 @@ pub struct WalRecord {
 
 /// A batched Write-Ahead Log writer.
 pub struct WalWriter {
+    pub id: u64,
     file: File,
     writer: BufWriter<File>,
     current_lsn: u64,
@@ -24,18 +25,17 @@ pub struct WalWriter {
 impl WalWriter {
     /// Opens or creates a WAL file at the given path.
     pub fn open<P: AsRef<Path>>(path: P, start_lsn: u64) -> Result<Self> {
+        let path_ref = path.as_ref();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
-            .open(path)?;
+            .open(path_ref)?;
 
-        // Need to clone the file handle for the BufWriter to allow sync_all on the original handle,
-        // or we can use BufWriter::into_inner / get_mut.
-        // Actually, BufWriter has a get_ref() to access the underlying file.
         let file_clone = file.try_clone()?;
 
         Ok(Self {
+            id: path_ref.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0),
             file: file_clone,
             writer: BufWriter::new(file),
             current_lsn: start_lsn,
@@ -103,42 +103,57 @@ impl WalReader {
         })
     }
 
-    /// Reads the next record from the WAL. Returns Ok(None) at EOF.
+    /// Reads the next record from the WAL. Returns Ok(None) at EOF or if a 
+    /// partial "Torn Write" is detected at the end of the file.
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         let mut checksum_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut checksum_buf) {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Ok(None);
+                return Ok(None); // Clean EOF
             }
             return Err(e.into());
         }
         let expected_checksum = u32::from_le_bytes(checksum_buf);
 
+        // From this point on, if we hit UnexpectedEof, it's a "Torn Write"
+        // (a record that was partially written when the power cut).
+        
         let mut lsn_buf = [0u8; 8];
-        self.reader.read_exact(&mut lsn_buf)?;
+        if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
+            return Self::handle_eof(e);
+        }
         let lsn = u64::from_le_bytes(lsn_buf);
 
         let mut key_len_buf = [0u8; 4];
-        self.reader.read_exact(&mut key_len_buf)?;
+        if let Err(e) = self.reader.read_exact(&mut key_len_buf) {
+            return Self::handle_eof(e);
+        }
         let key_len = u32::from_le_bytes(key_len_buf) as usize;
 
         let mut key_buf = vec![0u8; key_len];
-        self.reader.read_exact(&mut key_buf)?;
+        if let Err(e) = self.reader.read_exact(&mut key_buf) {
+            return Self::handle_eof(e);
+        }
 
         let mut is_tombstone_buf = [0u8; 1];
-        self.reader.read_exact(&mut is_tombstone_buf)?;
-
+        if let Err(e) = self.reader.read_exact(&mut is_tombstone_buf) {
+            return Self::handle_eof(e);
+        }
         let is_tombstone = is_tombstone_buf[0] == 1;
 
         let mut val_len_buf = [0u8; 4];
-        self.reader.read_exact(&mut val_len_buf)?;
+        if let Err(e) = self.reader.read_exact(&mut val_len_buf) {
+            return Self::handle_eof(e);
+        }
         let val_len = u32::from_le_bytes(val_len_buf) as usize;
 
         let value = if is_tombstone {
             EntryValue::Tombstone
         } else {
             let mut val_buf = vec![0u8; val_len];
-            self.reader.read_exact(&mut val_buf)?;
+            if let Err(e) = self.reader.read_exact(&mut val_buf) {
+                return Self::handle_eof(e);
+            }
             EntryValue::Value(Bytes::from(val_buf))
         };
 
@@ -155,6 +170,9 @@ impl WalReader {
 
         let actual_checksum = hasher.finalize();
         if actual_checksum != expected_checksum {
+            // If the checksum fails, we treat it as corruption.
+            // Note: In an even more advanced engine, we might check if this is 
+            // the absolute end of the file. If it is, it might still be a torn write.
             return Err(ApexError::ChecksumMismatch {
                 expected: expected_checksum,
                 found: actual_checksum,
@@ -166,5 +184,16 @@ impl WalReader {
             key: Bytes::from(key_buf),
             value,
         }))
+    }
+
+    fn handle_eof(err: std::io::Error) -> Result<Option<WalRecord>> {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            // This is a Torn Write. We logged the checksum but the power 
+            // cut before the full payload was written. 
+            // We return Ok(None) to signal that recovery is finished 
+            // and we should truncate the log here.
+            return Ok(None);
+        }
+        Err(err.into())
     }
 }
