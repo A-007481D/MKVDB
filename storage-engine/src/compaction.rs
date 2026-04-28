@@ -104,9 +104,11 @@ impl ApexEngine {
                 new_l1_ids.push(current_id);
             }
 
-            // Only add if it's not a tombstone, or if we want to keep tombstones?
-            // In Phase 2 L1 is the lowest level, so we CAN PURGE tombstones!
-            if !val.is_tombstone() {
+            // --- TOMBSTONE SAFETY ---
+            // A tombstone can only be purged if we are merging into the bottom-most level.
+            // In Phase 2, Level 1 is the floor, so it is safe to purge.
+            let is_bottom_level = true; 
+            if !val.is_tombstone() || !is_bottom_level {
                 current_builder.as_mut().unwrap().add(key.as_ref(), &val, lsn)?;
             }
 
@@ -173,6 +175,13 @@ impl ApexEngine {
         for id in new_l1_ids {
             manifest_guard.log_event(ManifestEvent::AddTable { level: 1, id })?;
         }
+        
+        // --- MANIFEST HARDENING ---
+        // Collapse the manifest log to prevent unbounded growth (Manifest Compaction)
+        if let Err(e) = manifest_guard.checkpoint() {
+            eprintln!("Warning: Manifest checkpoint failed: {e:?}");
+        }
+        
         drop(manifest_guard);
 
         // 3. Unlink old files (concurrent reads still work because of Arc)
