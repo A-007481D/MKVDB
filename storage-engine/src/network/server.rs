@@ -56,11 +56,19 @@ impl ApexServer {
             }
 
             let request = request?;
+            tracing::debug!("Received request: {:?}", request);
+
             let response = match request {
                 RespValue::Array(Some(mut args)) if !args.is_empty() => {
                     Self::dispatch_command(&engine, &mut args).await
                 }
-                _ => RespValue::Error("ERR unknown command or invalid format".to_string()),
+                RespValue::SimpleString(s) if s.to_uppercase() == "PING" => {
+                    RespValue::SimpleString("PONG".to_string())
+                }
+                _ => {
+                    tracing::warn!("Received invalid request format: {:?}", request);
+                    RespValue::Error("ERR unknown command or invalid format".to_string())
+                }
             };
 
             framed.send(response).await?;
@@ -156,6 +164,9 @@ impl ApexServer {
                 }
             }
             "PING" => RespValue::SimpleString("PONG".to_string()),
+            "COMMAND" => RespValue::Array(Some(vec![])),
+            "HELLO" => RespValue::Array(Some(vec![])),
+            "CLIENT" => RespValue::SimpleString("OK".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
         }
     }

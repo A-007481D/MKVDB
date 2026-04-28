@@ -6,10 +6,18 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize professional tracing
-    tracing_subscriber::fmt::init();
+    // Initialize professional tracing with debug level
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
     
-    let data_dir = "/tmp/mkvdb_data";
+    let args: Vec<String> = std::env::args().collect();
+    let data_dir = if let Some(pos) = args.iter().position(|a| a == "--path") {
+        args.get(pos + 1).map(|s| s.as_str()).unwrap_or("/tmp/mkvdb_data")
+    } else {
+        "/tmp/mkvdb_data"
+    };
+    
     std::fs::create_dir_all(data_dir)?;
 
     // Initialize the engine with "Nitro" Group Commit enabled
