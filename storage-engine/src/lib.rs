@@ -9,5 +9,5 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 
-pub use engine::ApexEngine;
+pub use engine::{ApexEngine, SyncPolicy};
 pub use error::{ApexError, Result};

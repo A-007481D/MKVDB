@@ -1,64 +1,182 @@
-use crate::error::{ApexError, Result};
+use crate::error::Result;
 use crate::manifest::{Manifest, ManifestEvent};
 use crate::memtable::{EntryValue, ImmutableMemTables, MemTable};
-use crate::sstable::{builder::SSTableBuilder, reader::{Block, SSTableReader}};
-use crate::wal::WalWriter;
+use crate::sstable::builder::SSTableBuilder;
+use crate::sstable::reader::{Block, SSTableReader};
+use crate::wal::{WalReader, WalWriter};
 use bytes::Bytes;
 use moka::sync::Cache;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
-pub struct EngineState {
-    pub active_memtable: Arc<MemTable>,
-    pub wal: WalWriter,
-    pub manifest: Manifest,
-    pub sstables: Vec<SSTableReader>, // Simplified for Phase 1: Just Level 0
+// ---------------------------------------------------------------------------
+// Sync Policy
+// ---------------------------------------------------------------------------
+
+/// Controls how the WAL is fsynced after writes.
+///
+/// - `EveryWrite`: Maximum durability. `fsync` after every single `put`/`delete`.
+///   Throughput is bounded by the SSD's IOPS (~few thousand on NVMe).
+/// - `Buffered`: Writes are buffered in user-space. The caller is responsible
+///   for calling `flush_wal()` at appropriate intervals (e.g. every N ms or
+///   every N writes). This is the "Group Commit" strategy used by Postgres and
+///   RocksDB to reach 150k+ writes/sec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    EveryWrite,
+    Buffered,
 }
 
+// ---------------------------------------------------------------------------
+// Version Set — the subset of state protected by RwLock
+// ---------------------------------------------------------------------------
+
+/// The "version set": the structural view of the database that readers need.
+///
+/// Protected by an `RwLock`. Readers hold a shared guard; only structural
+/// mutations (memtable rotation, SSTable list changes) take a write guard.
+pub struct VersionSet {
+    pub active_memtable: Arc<MemTable>,
+    pub manifest: Manifest,
+    pub sstables: Vec<SSTableReader>,
+}
+
+// ---------------------------------------------------------------------------
+// ApexEngine
+// ---------------------------------------------------------------------------
+
 /// The central coordinator for the ApexDB storage engine.
+///
+/// # Concurrency design
+///
+/// | Resource            | Lock                | Rationale                                    |
+/// |---------------------|---------------------|----------------------------------------------|
+/// | `VersionSet`        | `RwLock`            | Many concurrent readers, rare writers         |
+/// | `WalWriter`         | `Mutex`             | Serializes appends; held during I/O only      |
+/// | `ImmutableMemTables`| Internal `RwLock`   | Searched on the read path                    |
+/// | `block_cache`       | None (moka is safe) | Thread-safe LRU cache                        |
+///
+/// The critical insight: `write_internal` performs WAL I/O **outside** the
+/// `VersionSet` write-lock. The lock is only held for the nanosecond-fast
+/// in-memory memtable insert + size check.
 pub struct ApexEngine {
     data_dir: PathBuf,
-    state: Arc<RwLock<EngineState>>,
+    version: Arc<RwLock<VersionSet>>,
+    wal: Arc<Mutex<WalWriter>>,
     immutable_memtables: Arc<ImmutableMemTables>,
     block_cache: Cache<u64, Arc<Block>>,
+    /// Monotonically increasing sequence number. Atomic so the WAL append
+    /// (under Mutex) and the memtable insert can share the value without
+    /// needing the VersionSet lock.
+    next_lsn: AtomicU64,
+    sync_policy: SyncPolicy,
 }
 
 impl ApexEngine {
+    /// Opens the database at `path`, replaying WALs for crash recovery.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_policy(path, SyncPolicy::EveryWrite)
+    }
+
+    /// Opens the database with a specific WAL sync policy.
+    pub fn open_with_policy<P: AsRef<Path>>(path: P, sync_policy: SyncPolicy) -> Result<Self> {
         let data_dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
         let manifest_path = data_dir.join("MANIFEST");
         let mut manifest = Manifest::open(&manifest_path)?;
 
-        let start_lsn = manifest.current_seq;
-        let block_cache = Cache::new(1024 * 1024 * 1024 / 4096); // ~1GB cache (blocks of 4KB)
+        let block_cache: Cache<u64, Arc<Block>> = Cache::new(1024 * 1024 * 1024 / 4096);
         let immutable_memtables = Arc::new(ImmutableMemTables::new());
 
-        // For simplicity in Phase 1 start, we just initialize a fresh MemTable and WAL.
-        // Recovery logic would read existing WALs here.
-        let active_memtable = Arc::new(MemTable::new());
-        let wal_id = manifest.generate_file_id();
-        let wal_path = data_dir.join(format!("{:06}.wal", wal_id));
-        let wal = WalWriter::open(&wal_path, start_lsn)?;
+        // ---- Recover SSTables listed in the MANIFEST ----
+        let mut sstables = Vec::new();
+        // Level 0 is the only level in Phase 1
+        if let Some(ids) = manifest.levels.get(&0) {
+            let mut sorted_ids: Vec<u64> = ids.iter().copied().collect();
+            sorted_ids.sort_unstable();
+            for id in sorted_ids {
+                let sst_path = data_dir.join(format!("{id:06}.sst"));
+                if sst_path.exists() {
+                    let reader = SSTableReader::open(&sst_path, block_cache.clone())?;
+                    sstables.push(reader);
+                }
+            }
+        }
 
-        let state = EngineState {
+        // ---- Replay WAL files not yet flushed to SSTables ----
+        let active_memtable = Arc::new(MemTable::new());
+        let mut recovered_lsn: u64 = 0;
+
+        // Find WAL files on disk and replay those with id >= manifest.wal_id
+        let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let name = fname.to_string_lossy();
+                if let Some(stem) = name.strip_suffix(".wal") {
+                    if let Ok(id) = stem.parse::<u64>() {
+                        if id >= manifest.wal_id {
+                            wal_files.push((id, entry.path()));
+                        }
+                    }
+                }
+            }
+        }
+        wal_files.sort_by_key(|(id, _)| *id);
+
+        for (_wal_id, wal_path) in &wal_files {
+            let mut reader = WalReader::open(wal_path)?;
+            loop {
+                match reader.next_record() {
+                    Ok(Some(record)) => {
+                        recovered_lsn = recovered_lsn.max(record.lsn + 1);
+                        active_memtable.put(
+                            record.key,
+                            record.value,
+                            record.lsn,
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Partial/corrupt tail record — expected after a crash.
+                        // Stop replaying this WAL; all fully-written records
+                        // before this point have been recovered.
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- Open a fresh WAL for new writes ----
+        let wal_id = manifest.generate_file_id();
+        let wal_path = data_dir.join(format!("{wal_id:06}.wal"));
+        let wal = WalWriter::open(&wal_path, recovered_lsn)?;
+
+        let version = VersionSet {
             active_memtable,
-            wal,
             manifest,
-            sstables: Vec::new(),
+            sstables,
         };
 
         Ok(Self {
             data_dir,
-            state: Arc::new(RwLock::new(state)),
+            version: Arc::new(RwLock::new(version)),
+            wal: Arc::new(Mutex::new(wal)),
             immutable_memtables,
             block_cache,
+            next_lsn: AtomicU64::new(recovered_lsn),
+            sync_policy,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Write path
+    // -----------------------------------------------------------------------
 
     pub fn put(&self, key: Bytes, value: Bytes) -> Result<()> {
         self.write_internal(key, EntryValue::Value(value))
@@ -68,91 +186,154 @@ impl ApexEngine {
         self.write_internal(key, EntryValue::Tombstone)
     }
 
+    /// Core write path.
+    ///
+    /// 1. Acquire WAL mutex → append + optional fsync  (disk I/O, no version lock)
+    /// 2. Acquire version write-lock → insert into memtable (nanoseconds, in-memory)
+    /// 3. If memtable is full → rotate (still under version lock, but fast)
     fn write_internal(&self, key: Bytes, value: EntryValue) -> Result<()> {
-        let mut state = self.state.write();
-        
-        let lsn = state.wal.append(&key, &value)?;
-        state.wal.sync()?; // Fsync for every write. In production we'd batch this or use a background sync thread.
-        
-        state.active_memtable.put(key, value, lsn);
-        
-        state.manifest.log_event(ManifestEvent::UpdateSeq { seq: lsn })?;
+        // --- Phase 1: WAL I/O (outside version lock) ---
+        let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
 
-        // Check MemTable size
-        if state.active_memtable.size() >= MEMTABLE_SIZE_LIMIT {
-            self.trigger_flush(&mut state)?;
+        {
+            let mut wal = self.wal.lock();
+            wal.append(&key, &value)?;
+            if self.sync_policy == SyncPolicy::EveryWrite {
+                wal.sync()?;
+            }
+        } // WAL mutex released
+
+        // --- Phase 2: MemTable insert (under version lock, nanosecond-fast) ---
+        let needs_flush;
+        {
+            let version = self.version.read();
+            version.active_memtable.put(key, value, lsn);
+            needs_flush = version.active_memtable.size() >= MEMTABLE_SIZE_LIMIT;
+        } // version read-lock released
+
+        if needs_flush {
+            self.trigger_flush()?;
         }
 
         Ok(())
     }
 
-    fn trigger_flush(&self, state: &mut EngineState) -> Result<()> {
-        let old_memtable = std::mem::replace(&mut state.active_memtable, Arc::new(MemTable::new()));
-        self.immutable_memtables.push(old_memtable.clone());
+    /// Explicitly flush the WAL buffer to disk.
+    ///
+    /// Only meaningful under `SyncPolicy::Buffered`. Under `EveryWrite` this
+    /// is a no-op because every append already fsyncs.
+    pub fn flush_wal(&self) -> Result<()> {
+        let mut wal = self.wal.lock();
+        wal.sync()
+    }
 
-        let wal_id = state.manifest.generate_file_id();
-        let wal_path = self.data_dir.join(format!("{:06}.wal", wal_id));
-        let new_wal = WalWriter::open(&wal_path, state.manifest.current_seq)?;
-        state.wal = new_wal;
+    // -----------------------------------------------------------------------
+    // Flush (memtable → SSTable)
+    // -----------------------------------------------------------------------
 
-        let sst_id = state.manifest.generate_file_id();
-        let sst_path = self.data_dir.join(format!("{:06}.sst", sst_id));
-        
+    fn trigger_flush(&self) -> Result<()> {
+        let (old_memtable, sst_id, sst_path, wal_id) = {
+            let mut version = self.version.write();
+
+            // Rotate memtable
+            let old = std::mem::replace(
+                &mut version.active_memtable,
+                Arc::new(MemTable::new()),
+            );
+            self.immutable_memtables.push(Arc::clone(&old));
+
+            // Rotate WAL
+            let new_wal_id = version.manifest.generate_file_id();
+            let new_wal_path = self.data_dir.join(format!("{new_wal_id:06}.wal"));
+            let current_lsn = self.next_lsn.load(Ordering::Relaxed);
+            let new_wal = WalWriter::open(&new_wal_path, current_lsn)?;
+            {
+                let mut wal_guard = self.wal.lock();
+                // Ensure the old WAL is fully flushed before we swap it out.
+                wal_guard.sync()?;
+                *wal_guard = new_wal;
+            }
+
+            let sst_id = version.manifest.generate_file_id();
+            let sst_path = self.data_dir.join(format!("{sst_id:06}.sst"));
+
+            (old, sst_id, sst_path, new_wal_id)
+        }; // version write-lock released — writers are unblocked
+
+        // Spawn background flush
         let block_cache = self.block_cache.clone();
-        let immutable_queue = self.immutable_memtables.clone();
-        let state_lock = self.state.clone();
+        let imm_queue = Arc::clone(&self.immutable_memtables);
+        let version_lock = Arc::clone(&self.version);
 
-        // Spawn background flush thread
         tokio::spawn(async move {
-            if let Err(e) = Self::flush_memtable(sst_path, sst_id, old_memtable.clone(), block_cache, immutable_queue, state_lock) {
-                eprintln!("Background flush failed: {:?}", e);
+            if let Err(e) = Self::flush_memtable(
+                sst_path, sst_id, wal_id,
+                old_memtable, block_cache, imm_queue, version_lock,
+            ) {
+                eprintln!("Background flush failed: {e:?}");
             }
         });
 
         Ok(())
     }
 
+    /// Background: write an immutable memtable to an SSTable on disk.
+    ///
+    /// The MANIFEST update is the **last** step. If we crash before the
+    /// MANIFEST is written, the SSTable file is orphaned (harmless) and the
+    /// data will be replayed from the WAL on restart.
     fn flush_memtable(
         sst_path: PathBuf,
         sst_id: u64,
+        wal_id: u64,
         memtable: Arc<MemTable>,
         block_cache: Cache<u64, Arc<Block>>,
         immutable_queue: Arc<ImmutableMemTables>,
-        state_lock: Arc<RwLock<EngineState>>,
+        version_lock: Arc<RwLock<VersionSet>>,
     ) -> Result<()> {
+        // 1. Build SSTable on disk (no locks held)
         let mut builder = SSTableBuilder::new(&sst_path, 10_000)?;
-        
-        // Write out entries
         for entry in memtable.iter() {
             builder.add(entry.key().as_ref(), entry.value())?;
         }
         builder.finish()?;
 
-        // Add to version set
-        let mut state = state_lock.write();
-        state.manifest.log_event(ManifestEvent::AddTable { level: 0, id: sst_id })?;
-        
+        // 2. Update version set (short write-lock)
+        let mut version = version_lock.write();
         let reader = SSTableReader::open(&sst_path, block_cache)?;
-        state.sstables.push(reader);
+        version.sstables.push(reader);
 
-        // Remove from immutable queue
+        // 3. MANIFEST is the LAST step — atomic commitment point
+        version.manifest.log_event(ManifestEvent::AddTable { level: 0, id: sst_id })?;
+        version.manifest.log_event(ManifestEvent::SetWalId { wal_id })?;
+        drop(version);
+
+        // 4. Remove from immutable queue (safe: MANIFEST already persisted)
         immutable_queue.remove_flushed(memtable);
 
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Read path
+    // -----------------------------------------------------------------------
+
+    /// Point lookup. Searches: active memtable → immutable queue → SSTables.
+    ///
+    /// Uses only a **shared** (`read`) lock on the version set, so multiple
+    /// threads can read concurrently without blocking each other or writers.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        // 1. Active MemTable
-        let state = self.state.read();
-        if let Some(val) = state.active_memtable.get(key) {
+        // 1. Active MemTable (under shared lock)
+        let version = self.version.read();
+        if let Some(val) = version.active_memtable.get(key) {
             return match val {
                 EntryValue::Value(v) => Ok(Some(v)),
                 EntryValue::Tombstone => Ok(None),
             };
         }
-        drop(state);
+        drop(version);
 
-        // 2. Immutable MemTables
+        // 2. Immutable MemTables (own internal RwLock)
         if let Some(val) = self.immutable_memtables.get(key) {
             return match val {
                 EntryValue::Value(v) => Ok(Some(v)),
@@ -160,9 +341,9 @@ impl ApexEngine {
             };
         }
 
-        // 3. SSTables (Level 0, reverse order to get newest first)
-        let mut state = self.state.write(); // Need write lock for SSTableReader get due to potential cache updates or internal seeking
-        for reader in state.sstables.iter_mut().rev() {
+        // 3. SSTables (shared lock — SSTableReader::get takes &self)
+        let version = self.version.read();
+        for reader in version.sstables.iter().rev() {
             if let Some(val) = reader.get(key)? {
                 return match val {
                     EntryValue::Value(v) => Ok(Some(v)),
