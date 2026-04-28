@@ -213,7 +213,7 @@ impl ApexEngine {
     }
 
     fn recover_sstables(
-        data_dir: &Path,
+        _data_dir: &Path,
         manifest: &Manifest,
         table_cache: crate::sstable::cache::TableCache,
         block_cache: Cache<(u64, u64), Arc<Block>>,

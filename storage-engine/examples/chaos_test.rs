@@ -65,13 +65,13 @@ async fn run_write() {
     println!("\n✅ All {NUM_KEYS} keys written and fsynced to WAL.");
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  READY TO CRASH                                        ║");
-    println!("║                                                        ║");
-    println!("║  Hit Ctrl+C, or from another terminal:                 ║");
-    println!("║    kill -9 $(pgrep chaos_test)                         ║");
-    println!("║                                                        ║");
-    println!("║  Then run:                                              ║");
-    println!("║    cargo run --example chaos_test -- --recover          ║");
+    println!("║  READY TO CRASH                                          ║");
+    println!("║                                                          ║");
+    println!("║  Hit Ctrl+C, or from another terminal:                   ║");
+    println!("║    kill -9 $(pgrep chaos_test)                           ║");
+    println!("║                                                          ║");
+    println!("║  Then run:                                               ║");
+    println!("║    cargo run --example chaos_test -- --recover           ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
     // Block forever — the only way out is a signal.

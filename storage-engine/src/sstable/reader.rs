@@ -6,7 +6,6 @@ use moka::sync::Cache;
 
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC_NUMBER: u64 = 0xA9E8_D8B1_7F1A_2B3C;
