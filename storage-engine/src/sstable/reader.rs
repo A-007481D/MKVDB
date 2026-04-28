@@ -135,14 +135,6 @@ impl SSTableReader {
             Err(idx) => idx - 1,
         };
 
-        let block_offset = self.sparse_index[block_idx].1;
-
-        // Determine size of the block to read
-        let next_offset = if block_idx + 1 < self.sparse_index.len() {
-            self.sparse_index[block_idx + 1].1
-        } else {
-            self.index_offset
-        };
 
         // 3. Block Cache lookup & verification
         let block = self.get_block(block_idx)?;
