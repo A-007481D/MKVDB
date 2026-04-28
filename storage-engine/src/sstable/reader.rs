@@ -46,7 +46,9 @@ impl SSTableReader {
         let magic = u64::from_le_bytes(footer_buf[16..24].try_into().unwrap());
 
         if magic != MAGIC_NUMBER {
-            return Err(ApexError::Corruption("Invalid magic number in SSTable footer".to_string()));
+            return Err(ApexError::Corruption(
+                "Invalid magic number in SSTable footer".to_string(),
+            ));
         }
 
         // Read Index
@@ -95,7 +97,8 @@ impl SSTableReader {
         let mut bitmap = vec![0u8; bitmap_len];
         file.read_exact(&mut bitmap)?;
 
-        let bloom_filter = Bloom::from_existing(&bitmap, num_bits, num_hashes, [(k1_0, k1_1), (k2_0, k2_1)]);
+        let bloom_filter =
+            Bloom::from_existing(&bitmap, num_bits, num_hashes, [(k1_0, k1_1), (k2_0, k2_1)]);
 
         Ok(Self {
             file: Mutex::new(file),
@@ -119,7 +122,10 @@ impl SSTableReader {
         }
 
         // 2. Sparse Index Binary Search — pure in-memory
-        let block_idx = match self.sparse_index.binary_search_by(|(k, _)| k.as_ref().cmp(key)) {
+        let block_idx = match self
+            .sparse_index
+            .binary_search_by(|(k, _)| k.as_ref().cmp(key))
+        {
             Ok(idx) => idx,
             Err(0) => return Ok(None),
             Err(idx) => idx - 1,
@@ -140,7 +146,7 @@ impl SSTableReader {
         } else {
             // Cache miss: acquire the file mutex to read from disk
             let mut file = self.file.lock();
-            
+
             // Double-check: another thread may have populated the cache while we waited
             if let Some(b) = self.block_cache.get(&block_offset) {
                 return Ok(Self::search_block(&b, key));
@@ -152,7 +158,9 @@ impl SSTableReader {
             file.read_exact(&mut block_data)?;
             drop(file); // Release file mutex ASAP
 
-            let b = Arc::new(Block { data: Bytes::from(block_data) });
+            let b = Arc::new(Block {
+                data: Bytes::from(block_data),
+            });
             self.block_cache.insert(block_offset, Arc::clone(&b));
             b
         };
@@ -166,28 +174,38 @@ impl SSTableReader {
         let data = &block.data;
 
         while cursor < data.len() {
-            if cursor + 4 > data.len() { break; }
+            if cursor + 4 > data.len() {
+                break;
+            }
 
-            let key_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().unwrap()) as usize;
+            let key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
 
-            if cursor + key_len > data.len() { break; }
-            let entry_key = &data[cursor..cursor+key_len];
+            if cursor + key_len > data.len() {
+                break;
+            }
+            let entry_key = &data[cursor..cursor + key_len];
             cursor += key_len;
 
-            if cursor + 1 > data.len() { break; }
+            if cursor + 1 > data.len() {
+                break;
+            }
             let is_tombstone = data[cursor] == 1;
             cursor += 1;
 
-            if cursor + 4 > data.len() { break; }
-            let val_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().unwrap()) as usize;
+            if cursor + 4 > data.len() {
+                break;
+            }
+            let val_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
 
             let entry_val = if is_tombstone {
                 EntryValue::Tombstone
             } else {
-                if cursor + val_len > data.len() { break; }
-                let v = &data[cursor..cursor+val_len];
+                if cursor + val_len > data.len() {
+                    break;
+                }
+                let v = &data[cursor..cursor + val_len];
                 cursor += val_len;
                 EntryValue::Value(Bytes::copy_from_slice(v))
             };

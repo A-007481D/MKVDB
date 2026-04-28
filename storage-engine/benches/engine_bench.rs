@@ -12,7 +12,7 @@
 //! HTML reports are generated in `target/criterion/`.
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::time::Duration;
 use storage_engine::engine::{ApexEngine, SyncPolicy};
 use tempfile::tempdir;
@@ -32,8 +32,8 @@ fn bench_put(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("sync_policy", "EveryWrite"), |b| {
         let dir = tempdir().expect("tempdir");
         let _guard = rt.enter();
-        let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite)
-            .expect("open engine");
+        let engine =
+            ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).expect("open engine");
 
         let mut i: u64 = 0;
         b.iter(|| {
@@ -51,8 +51,8 @@ fn bench_put(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("sync_policy", "Buffered"), |b| {
         let dir = tempdir().expect("tempdir");
         let _guard = rt.enter();
-        let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::Buffered)
-            .expect("open engine");
+        let engine =
+            ApexEngine::open_with_policy(dir.path(), SyncPolicy::Buffered).expect("open engine");
 
         let mut i: u64 = 0;
         b.iter(|| {
@@ -103,8 +103,8 @@ fn bench_get(c: &mut Criterion) {
     // Pre-populate engine with 10,000 keys
     let dir = tempdir().expect("tempdir");
     let _guard = rt.enter();
-    let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::Buffered)
-        .expect("open engine");
+    let engine =
+        ApexEngine::open_with_policy(dir.path(), SyncPolicy::Buffered).expect("open engine");
 
     let num_keys: u64 = 10_000;
     for i in 0..num_keys {

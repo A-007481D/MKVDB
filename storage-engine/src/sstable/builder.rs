@@ -62,13 +62,16 @@ impl SSTableBuilder {
 
         // Check if we need to flush the current block before adding the new entry
         // (Unless the block is empty, we don't want to flush an empty block just because a large entry arrives).
-        if !self.current_block.is_empty() && self.current_block.len() + entry_bytes.len() > BLOCK_SIZE {
+        if !self.current_block.is_empty()
+            && self.current_block.len() + entry_bytes.len() > BLOCK_SIZE
+        {
             self.flush_current_block()?;
         }
 
         if self.current_block.is_empty() {
             // This is the first key of a new block. Add it to the sparse index.
-            self.sparse_index.push((Bytes::copy_from_slice(key), self.current_offset));
+            self.sparse_index
+                .push((Bytes::copy_from_slice(key), self.current_offset));
         }
 
         self.current_block.extend_from_slice(&entry_bytes);
@@ -115,21 +118,21 @@ impl SSTableBuilder {
         // Let's implement a simple serialization.
         let sip_keys = self.bloom_filter.sip_keys();
         let bitmap = self.bloom_filter.bitmap();
-        
+
         let mut bloom_bytes = Vec::new();
         bloom_bytes.extend_from_slice(&sip_keys[0].0.to_le_bytes());
         bloom_bytes.extend_from_slice(&sip_keys[0].1.to_le_bytes());
         bloom_bytes.extend_from_slice(&sip_keys[1].0.to_le_bytes());
         bloom_bytes.extend_from_slice(&sip_keys[1].1.to_le_bytes());
-        
+
         bloom_bytes.extend_from_slice(&self.bloom_filter.number_of_bits().to_le_bytes());
         bloom_bytes.extend_from_slice(&self.bloom_filter.number_of_hash_functions().to_le_bytes());
-        
+
         bloom_bytes.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
         bloom_bytes.extend_from_slice(&bitmap);
 
         self.writer.write_all(&bloom_bytes)?;
-        
+
         // Write Footer
         // [Index Offset (8)] [Bloom Offset (8)] [Magic (8)]
         self.writer.write_all(&index_offset.to_le_bytes())?;
@@ -138,7 +141,10 @@ impl SSTableBuilder {
 
         self.writer.flush()?;
         // The file handle is flushed but we also want an fsync on the SSTable
-        self.writer.into_inner().map_err(std::io::IntoInnerError::into_error)?.sync_all()?;
+        self.writer
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
         Ok(())
     }
 }

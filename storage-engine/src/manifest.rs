@@ -58,7 +58,9 @@ impl Manifest {
 
         for line in reader.lines() {
             let line = line?;
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let parts: Vec<&str> = line.split(',').collect();
 
             match parts[0] {

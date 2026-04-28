@@ -7,17 +7,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// nanoseconds is perfectly acceptable for dashboards and benchmarks.
 #[derive(Debug)]
 pub struct EngineMetrics {
-    /// Total bytes written to the WAL (before compression, if any).
+    /// (before compression, if any).
     pub total_bytes_written: AtomicU64,
     /// Total number of `fsync` / `fdatasync` calls on the WAL.
     pub total_wal_syncs: AtomicU64,
     /// Total block cache hits (block found in `moka` without disk I/O).
     pub cache_hits: AtomicU64,
-    /// Total block cache misses (required a disk read).
+    /// (required a disk read).
     pub cache_misses: AtomicU64,
-    /// Total number of `put` operations executed.
     pub total_puts: AtomicU64,
-    /// Total number of `get` operations executed.
     pub total_gets: AtomicU64,
 }
 

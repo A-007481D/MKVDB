@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryValue {
@@ -62,14 +62,15 @@ impl MemTable {
         };
 
         // If the key already exists, we are replacing it. The size calculation
-        // is approximate, so we just add the new sizes. For strict limits, we might 
+        // is approximate, so we just add the new sizes. For strict limits, we might
         // want to subtract the old size if we can efficiently find it.
         // For LSM memtables, usually we just accumulate and flush when total written hits a threshold.
         let added_size = key_len + val_len;
-        
+
         self.map.insert(key, value);
-        self.approximate_size.fetch_add(added_size, Ordering::Relaxed);
-        
+        self.approximate_size
+            .fetch_add(added_size, Ordering::Relaxed);
+
         // Update sequence numbers (relaxed is fine as we serialize the actual seq assignment in the WAL)
         let _ = self.first_seq.fetch_min(seq, Ordering::Relaxed);
         let _ = self.last_seq.fetch_max(seq, Ordering::Relaxed);
@@ -145,7 +146,7 @@ impl ImmutableMemTables {
             guard.remove(idx);
         }
     }
-    
+
     /// Returns a copy of the current queue for a flush thread to process.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Arc<MemTable>> {

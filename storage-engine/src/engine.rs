@@ -9,8 +9,8 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
@@ -173,9 +173,8 @@ impl ApexEngine {
             let interval = *interval;
 
             tokio::spawn(async move {
-                Self::background_sync_loop(
-                    wal_ref, dirty_ref, shutdown_ref, metrics_ref, interval,
-                ).await;
+                Self::background_sync_loop(wal_ref, dirty_ref, shutdown_ref, metrics_ref, interval)
+                    .await;
             });
         }
 
@@ -318,10 +317,7 @@ impl ApexEngine {
             let mut version = self.version.write();
 
             // Rotate memtable
-            let old = std::mem::replace(
-                &mut version.active_memtable,
-                Arc::new(MemTable::new()),
-            );
+            let old = std::mem::replace(&mut version.active_memtable, Arc::new(MemTable::new()));
             self.immutable_memtables.push(Arc::clone(&old));
 
             // Rotate WAL
@@ -349,8 +345,13 @@ impl ApexEngine {
 
         tokio::spawn(async move {
             if let Err(e) = Self::flush_memtable(
-                sst_path, sst_id, wal_id,
-                old_memtable, block_cache, imm_queue, version_lock,
+                sst_path,
+                sst_id,
+                wal_id,
+                old_memtable,
+                block_cache,
+                imm_queue,
+                version_lock,
             ) {
                 eprintln!("Background flush failed: {e:?}");
             }
@@ -386,8 +387,13 @@ impl ApexEngine {
         version.sstables.push(reader);
 
         // 3. MANIFEST is the LAST step — atomic commitment point
-        version.manifest.log_event(ManifestEvent::AddTable { level: 0, id: sst_id })?;
-        version.manifest.log_event(ManifestEvent::SetWalId { wal_id })?;
+        version.manifest.log_event(ManifestEvent::AddTable {
+            level: 0,
+            id: sst_id,
+        })?;
+        version
+            .manifest
+            .log_event(ManifestEvent::SetWalId { wal_id })?;
         drop(version);
 
         // 4. Remove from immutable queue (safe: MANIFEST already persisted)
