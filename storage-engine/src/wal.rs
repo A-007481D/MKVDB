@@ -92,6 +92,11 @@ impl WalWriter {
         self.file.sync_data()?;
         Ok(())
     }
+
+    /// Returns the current size of the WAL file on disk.
+    pub fn file_size(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
 }
 
 /// A reader to recover state from a WAL file during crash recovery.
