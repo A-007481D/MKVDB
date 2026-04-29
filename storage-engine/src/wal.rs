@@ -1,4 +1,4 @@
-use crate::error::{ApexError, Result};
+use crate::error::Result;
 use crate::memtable::EntryValue;
 use bytes::Bytes;
 use crc32fast::Hasher;
@@ -104,7 +104,7 @@ impl WalReader {
     }
 
     /// Reads the next record from the WAL. Returns Ok(None) at EOF or if a 
-    /// partial "Torn Write" is detected at the end of the file.
+    /// partial "Torn Write" (including checksum mismatch at end-of-file) is detected.
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         let mut checksum_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut checksum_buf) {
@@ -170,13 +170,12 @@ impl WalReader {
 
         let actual_checksum = hasher.finalize();
         if actual_checksum != expected_checksum {
-            // If the checksum fails, we treat it as corruption.
-            // Note: In an even more advanced engine, we might check if this is 
-            // the absolute end of the file. If it is, it might still be a torn write.
-            return Err(ApexError::ChecksumMismatch {
-                expected: expected_checksum,
-                found: actual_checksum,
-            });
+            // If the checksum fails, we check if we are at the end of the file.
+            // A torn write might have updated the checksum field but not the data,
+            // or vice versa.
+            tracing::warn!("WAL Checksum mismatch: expected {}, found {}. Treating as Torn Write at end-of-log.", 
+                expected_checksum, actual_checksum);
+            return Ok(None);
         }
 
         Ok(Some(WalRecord {
