@@ -109,6 +109,8 @@ impl SSTableBuilder {
         self.writer.write_all(&compressed_block)?;
         self.writer.write_all(&checksum.to_le_bytes())?; // 4-byte checksum footer
 
+        // Increment current_offset by the COMPRESSED size + checksum footer.
+        // This ensures the sparse index points to exact block boundaries on disk.
         self.current_offset += (compressed_block.len() + 4) as u64;
         self.current_block.clear();
         Ok(())
