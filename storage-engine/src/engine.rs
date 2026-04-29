@@ -720,6 +720,33 @@ impl ApexEngine {
         tracing::info!("Checkpoint created successfully at {:?}", cp_path);
         Ok(())
     }
+
+    /// Gracefully shuts down the engine, ensuring all buffered data is persisted.
+    ///
+    /// 1. Signals background tasks (sync, compaction) to exit.
+    /// 2. Flushes the active MemTable to an SSTable.
+    /// 3. Synchronously flushes and closes the WAL.
+    pub fn shutdown(&self) -> Result<()> {
+        info!("Shutting down ApexEngine...");
+        
+        // 1. Signal background tasks
+        self.shutdown.store(true, Ordering::Release);
+        self.sync_notifier.notify_waiters();
+
+        // 2. Force flush active memtable
+        // This ensures all data is in SSTables and WAL can be truncated/deleted on next start.
+        if self.version_set.load().active_memtable.size() > 0 {
+            info!("Shutdown: Flushing active memtable...");
+            self.force_flush()?;
+        }
+
+        // 3. Final WAL sync
+        let mut wal = self.wal.lock();
+        wal.sync()?;
+        info!("ApexEngine shutdown complete.");
+        
+        Ok(())
+    }
 }
 
 
