@@ -25,7 +25,7 @@ async fn test_compaction_shrink() {
         let sst_count = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "sst"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
             .count();
         
         // We started with 5 files. After compaction, they should be merged into L1.
