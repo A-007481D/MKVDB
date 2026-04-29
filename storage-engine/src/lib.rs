@@ -22,19 +22,19 @@
     clippy::cast_sign_loss
 )]
 
+pub mod batch;
+pub mod compaction;
 pub mod engine;
 pub mod error;
+pub mod iterator;
 pub mod manifest;
 pub mod memtable;
 pub mod metrics;
+pub mod network;
 pub mod sstable;
 pub mod wal;
-pub mod iterator;
-pub mod compaction;
-pub mod network;
-pub mod batch;
 
-pub use engine::{ApexEngine, SyncPolicy};
 pub use batch::WriteBatch;
+pub use engine::{ApexConfig, ApexEngine, SyncPolicy};
 pub use error::{ApexError, Result};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
