@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
-use tokio_util::codec::{Decoder, Encoder};
 use std::io;
+use tokio_util::codec::{Decoder, Encoder};
 
 /// Represents a RESP (Redis Serialization Protocol) value.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +29,10 @@ impl Decoder for RespCodec {
             b':' => Self::decode_integer(src),
             b'$' => Self::decode_bulk_string(src),
             b'*' => self.decode_array(src),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown RESP type")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unknown RESP type",
+            )),
         }
     }
 }
@@ -62,7 +65,9 @@ impl RespCodec {
             let line = src.split_to(pos).split_off(1); // Skip ':'
             src.advance(2); // Skip CRLF
             let s = String::from_utf8_lossy(&line);
-            let n = s.parse::<i64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid integer"))?;
+            let n = s
+                .parse::<i64>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid integer"))?;
             Ok(Some(RespValue::Integer(n)))
         } else {
             Ok(None)
@@ -73,15 +78,20 @@ impl RespCodec {
         if let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
             let len_line = src.windows(pos).next().unwrap();
             let len_str = String::from_utf8_lossy(&len_line[1..]);
-            let len = len_str.parse::<i32>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length"))?;
+            let len = len_str.parse::<i32>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length")
+            })?;
 
             if len == -1 {
                 src.advance(pos + 2);
                 return Ok(Some(RespValue::BulkString(None)));
             }
-            
+
             if len < 0 {
-                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid bulk string length",
+                ));
             }
 
             let ulen = len as usize;
@@ -102,7 +112,9 @@ impl RespCodec {
         if let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
             let len_line = &src[1..pos];
             let len_str = String::from_utf8_lossy(len_line);
-            let len = len_str.parse::<i32>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid array length"))?;
+            let len = len_str
+                .parse::<i32>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid array length"))?;
 
             if len == -1 {
                 src.advance(pos + 2);
@@ -110,19 +122,22 @@ impl RespCodec {
             }
 
             if len < 0 {
-                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid array length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid array length",
+                ));
             }
 
             let ulen = len as usize;
-            
+
             // We need to keep track of how many bytes we've "virtually" consumed
             let mut offset = pos + 2;
-            
+
             for _ in 0..ulen {
                 if offset >= src.len() {
                     return Ok(None);
                 }
-                
+
                 match Self::check_enough_data(&src[offset..])? {
                     Some(consumed) => offset += consumed,
                     None => return Ok(None),
@@ -158,12 +173,17 @@ impl RespCodec {
             b'$' => {
                 if let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
                     let len_str = String::from_utf8_lossy(&src[1..pos]);
-                    let len = len_str.parse::<i32>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length"))?;
+                    let len = len_str.parse::<i32>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length")
+                    })?;
                     if len == -1 {
                         return Ok(Some(pos + 2));
                     }
                     if len < 0 {
-                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid bulk string length"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid bulk string length",
+                        ));
                     }
                     let total = pos + 2 + len as usize + 2;
                     if src.len() >= total {
@@ -178,12 +198,17 @@ impl RespCodec {
             b'*' => {
                 if let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
                     let len_str = String::from_utf8_lossy(&src[1..pos]);
-                    let len = len_str.parse::<i32>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid array length"))?;
+                    let len = len_str.parse::<i32>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid array length")
+                    })?;
                     if len == -1 {
                         return Ok(Some(pos + 2));
                     }
                     if len < 0 {
-                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid array length"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid array length",
+                        ));
                     }
                     let mut offset = pos + 2;
                     for _ in 0..len {
@@ -200,7 +225,10 @@ impl RespCodec {
                     Ok(None)
                 }
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown RESP type")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unknown RESP type",
+            )),
         }
     }
 }

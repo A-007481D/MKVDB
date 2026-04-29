@@ -59,7 +59,8 @@ impl DbIterator for SSTableIterator {
                 if cursor + 4 > data.len() {
                     break;
                 }
-                let key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let key_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
 
                 if cursor + key_len > data.len() {
@@ -83,7 +84,8 @@ impl DbIterator for SSTableIterator {
                 if cursor + 4 > data.len() {
                     break;
                 }
-                let val_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let val_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
 
                 let entry_val = if is_tombstone {
@@ -100,19 +102,23 @@ impl DbIterator for SSTableIterator {
                 self.cursor = cursor;
                 self.current_entry = Some((entry_key, entry_val, lsn));
                 return Ok(true);
-            } 
-            
+            }
+
             self.current_entry = None;
             return Ok(false);
         }
-        
+
         self.current_entry = None;
         Ok(false)
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<bool> {
         // 1. Binary search the sparse index to find the best candidate block
-        self.block_idx = match self.reader.sparse_index.binary_search_by(|(k, _)| k.as_ref().cmp(target)) {
+        self.block_idx = match self
+            .reader
+            .sparse_index
+            .binary_search_by(|(k, _)| k.as_ref().cmp(target))
+        {
             Ok(idx) => idx,
             Err(0) => 0,
             Err(idx) => idx - 1,

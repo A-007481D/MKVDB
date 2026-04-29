@@ -17,6 +17,8 @@ pub struct EngineMetrics {
     pub cache_misses: AtomicU64,
     pub total_puts: AtomicU64,
     pub total_gets: AtomicU64,
+    /// Total number of write operations that were stalled due to saturation.
+    pub stall_count: AtomicU64,
 }
 
 impl Default for EngineMetrics {
@@ -35,6 +37,7 @@ impl EngineMetrics {
             cache_misses: AtomicU64::new(0),
             total_puts: AtomicU64::new(0),
             total_gets: AtomicU64::new(0),
+            stall_count: AtomicU64::new(0),
         }
     }
 
@@ -62,6 +65,10 @@ impl EngineMetrics {
         self.total_gets.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_stall(&self) {
+        self.stall_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns a snapshot of all counters for display / export.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -72,6 +79,7 @@ impl EngineMetrics {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             total_puts: self.total_puts.load(Ordering::Relaxed),
             total_gets: self.total_gets.load(Ordering::Relaxed),
+            stall_count: self.stall_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -85,6 +93,7 @@ pub struct MetricsSnapshot {
     pub cache_misses: u64,
     pub total_puts: u64,
     pub total_gets: u64,
+    pub stall_count: u64,
 }
 
 impl std::fmt::Display for MetricsSnapshot {
@@ -96,9 +105,10 @@ impl std::fmt::Display for MetricsSnapshot {
         };
         write!(
             f,
-            "puts={} gets={} wal_bytes={} wal_syncs={} cache_hit_rate={:.1}% (hits={} misses={})",
+            "puts={} gets={} stalls={} wal_bytes={} wal_syncs={} cache_hit_rate={:.1}% (hits={} misses={})",
             self.total_puts,
             self.total_gets,
+            self.stall_count,
             self.total_bytes_written,
             self.total_wal_syncs,
             hit_rate,

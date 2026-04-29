@@ -1,8 +1,8 @@
 pub mod builder;
-pub mod reader;
-pub mod iterator;
 pub mod cache;
+pub mod iterator;
+pub mod reader;
 
 pub use builder::SSTableBuilder;
-pub use reader::SSTableReader;
 pub use iterator::SSTableIterator;
+pub use reader::SSTableReader;

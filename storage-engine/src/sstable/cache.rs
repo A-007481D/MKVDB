@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Manages a pool of open file descriptors for SSTables.
-/// 
+///
 /// This prevents "Too many open files" errors by evicting older
 /// file handles when the limit is reached.
 #[derive(Clone)]
@@ -33,7 +33,7 @@ impl TableCache {
         let path = self.data_dir.join(format!("{id:06}.sst"));
         let file = File::open(path)?;
         let arc_file = Arc::new(file);
-        
+
         self.cache.insert(id, Arc::clone(&arc_file));
         Ok(arc_file)
     }

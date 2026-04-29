@@ -1,12 +1,12 @@
 use crate::error::Result;
 use crate::memtable::EntryValue;
 use bytes::Bytes;
+use futures_util::Stream;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use futures_util::Stream;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// The standard Iterator interface for the engine.
 /// We yield owned `Bytes` and `EntryValue` to avoid complex lifetime constraints.
@@ -17,16 +17,16 @@ pub trait DbIterator: Send {
 
     /// Seek to the first key >= `target`. Returns true if valid.
     fn seek(&mut self, target: &[u8]) -> Result<bool>;
-    
+
     /// Returns the current key. Panics if !is_valid().
     fn key(&self) -> Bytes;
-    
+
     /// Returns the current value. Panics if !is_valid().
     fn value(&self) -> EntryValue;
-    
+
     /// Returns the current LSN. Panics if !is_valid().
     fn lsn(&self) -> u64;
-    
+
     /// Returns true if the iterator is currently pointing to a valid element.
     fn is_valid(&self) -> bool;
 }
@@ -59,7 +59,9 @@ impl MemTableIterator {
 impl DbIterator for MemTableIterator {
     fn next(&mut self) -> Result<bool> {
         let next_entry = if let Some((current_key, _, _)) = &self.current {
-            self.memtable.map.lower_bound(std::ops::Bound::Excluded(current_key))
+            self.memtable
+                .map
+                .lower_bound(std::ops::Bound::Excluded(current_key))
         } else {
             None
         };
@@ -75,7 +77,10 @@ impl DbIterator for MemTableIterator {
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<bool> {
-        let entry = self.memtable.map.lower_bound(std::ops::Bound::Included(target));
+        let entry = self
+            .memtable
+            .map
+            .lower_bound(std::ops::Bound::Included(target));
         if let Some(e) = entry {
             let (val, lsn) = e.value();
             self.current = Some((e.key().clone(), val.clone(), *lsn));
@@ -122,7 +127,7 @@ impl Ord for HeapElement {
     fn cmp(&self, other: &Self) -> Ordering {
         match other.key.cmp(&self.key) {
             Ordering::Equal => self.lsn.cmp(&other.lsn), // Highest LSN wins (max heap for LSN)
-            other_cmp => other_cmp, // Reverse for key (min heap for key)
+            other_cmp => other_cmp,                      // Reverse for key (min heap for key)
         }
     }
 }
@@ -150,7 +155,7 @@ pub struct MergingIterator {
 impl MergingIterator {
     pub fn new(mut iterators: Vec<Box<dyn DbIterator>>) -> Result<Self> {
         let mut heap = BinaryHeap::new();
-        
+
         for (i, iter) in iterators.iter_mut().enumerate() {
             if iter.is_valid() {
                 heap.push(HeapElement {
@@ -186,7 +191,7 @@ impl MergingIterator {
         // Pop the minimum element
         if let Some(top) = self.heap.pop() {
             self.current_idx = Some(top.iter_idx);
-            
+
             // CONFLICT RESOLUTION:
             while let Some(peek) = self.heap.peek() {
                 if peek.key == top.key {
@@ -288,7 +293,8 @@ impl Stream for ScanStream {
 
             // Check range bounds (Inclusive)
             if let Some(end) = &self.end_key
-                && key.as_ref() > end.as_ref() {
+                && key.as_ref() > end.as_ref()
+            {
                 return Poll::Ready(None);
             }
 
@@ -307,4 +313,3 @@ impl Stream for ScanStream {
         }
     }
 }
-

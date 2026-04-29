@@ -1,24 +1,25 @@
+use crate::batch::{BatchOp, WriteBatch};
 use crate::error::{ApexError, Result};
+use crate::iterator::{DbIterator, MemTableIterator, MergingIterator, ScanStream};
 use crate::manifest::{Manifest, ManifestEvent};
-use std::collections::HashSet;
 use crate::memtable::{EntryValue, ImmutableMemTables, MemTable};
 use crate::metrics::EngineMetrics;
 use crate::sstable::builder::SSTableBuilder;
+use crate::sstable::iterator::SSTableIterator;
 use crate::sstable::reader::{Block, SSTableReader};
 use crate::wal::{WalReader, WalWriter};
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use moka::sync::Cache;
 use parking_lot::Mutex;
-use arc_swap::ArcSwap;
+use std::collections::HashSet;
 use std::fs::File;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
-use crate::iterator::{DbIterator, MemTableIterator, MergingIterator, ScanStream};
-use crate::sstable::iterator::SSTableIterator;
-use crate::batch::{WriteBatch, BatchOp};
-use tracing::{info, error};
+use std::time::{Duration, Instant};
+use tracing::{error, info};
 
 const MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -54,7 +55,77 @@ pub enum SyncPolicy {
 /// Managed via `ArcSwap` for lock-free lock-stripping.
 pub struct Version {
     pub active_memtable: Arc<MemTable>,
-    pub sstables: Vec<Arc<SSTableReader>>,
+    pub levels: Vec<Vec<Arc<SSTableReader>>>,
+}
+
+impl Version {
+    pub fn l0_count(&self) -> usize {
+        self.levels.first().map_or(0, Vec::len)
+    }
+
+    pub fn all_sstables(&self) -> Vec<Arc<SSTableReader>> {
+        self.levels.iter().flatten().cloned().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for the ApexEngine.
+#[derive(Debug, Clone)]
+pub struct ApexConfig {
+    pub memtable_size_limit: usize,
+    pub l0_compaction_threshold: usize,
+    pub immutable_memtable_threshold: usize,
+    pub max_concurrent_ops: usize,
+    pub sync_policy: SyncPolicy,
+}
+
+impl Default for ApexConfig {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(4, NonZero::get);
+
+        Self {
+            memtable_size_limit: 64 * 1024 * 1024, // 64MB
+            l0_compaction_threshold: 4,
+            immutable_memtable_threshold: 4, // Allow 4 immutables before stall
+            max_concurrent_ops: parallelism * 8,
+            sync_policy: SyncPolicy::EveryWrite,
+        }
+    }
+}
+
+impl ApexConfig {
+    #[must_use]
+    pub fn with_memtable_size(mut self, size: usize) -> Self {
+        self.memtable_size_limit = size;
+        self
+    }
+
+    #[must_use]
+    pub fn with_l0_threshold(mut self, count: usize) -> Self {
+        self.l0_compaction_threshold = count;
+        self
+    }
+
+    #[must_use]
+    pub fn with_immutable_threshold(mut self, count: usize) -> Self {
+        self.immutable_memtable_threshold = count;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_concurrency(mut self, count: usize) -> Self {
+        self.max_concurrent_ops = count;
+        self
+    }
+
+    #[must_use]
+    pub fn with_sync_policy(mut self, policy: SyncPolicy) -> Self {
+        self.sync_policy = policy;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,19 +133,6 @@ pub struct Version {
 // ---------------------------------------------------------------------------
 
 /// The central coordinator for the ApexDB storage engine.
-///
-/// # Concurrency design
-///
-/// | Resource            | Lock                | Rationale                                    |
-/// |---------------------|---------------------|----------------------------------------------|
-/// | `VersionSet`        | `RwLock`            | Many concurrent readers, rare writers         |
-/// | `WalWriter`         | `Mutex`             | Serializes appends; held during I/O only      |
-/// | `ImmutableMemTables`| Internal `RwLock`   | Searched on the read path                    |
-/// | `block_cache`       | None (moka is safe) | Thread-safe LRU cache                        |
-///
-/// The critical insight: `write_internal` performs WAL I/O **outside** the
-/// `VersionSet` write-lock. The lock is only held for the nanosecond-fast
-/// in-memory memtable insert + size check.
 pub struct ApexEngine {
     pub(crate) data_dir: PathBuf,
     pub(crate) version_set: Arc<ArcSwap<Version>>,
@@ -83,30 +141,27 @@ pub struct ApexEngine {
     pub(crate) immutable_memtables: Arc<ImmutableMemTables>,
     pub(crate) table_cache: crate::sstable::cache::TableCache,
     pub(crate) block_cache: Cache<(u64, u64), Arc<Block>>,
-    /// Monotonically increasing sequence number. Atomic so the WAL append
-    /// (under Mutex) and the memtable insert can share the value without
-    /// needing the VersionSet lock.
     pub(crate) next_lsn: AtomicU64,
-    pub(crate) sync_policy: SyncPolicy,
+    pub(crate) config: ApexConfig,
+    pub(crate) concurrency_semaphore: Arc<tokio::sync::Semaphore>,
     /// Engine-wide I/O counters for observability.
     pub(crate) metrics: Arc<EngineMetrics>,
     /// Signals the background sync task to shut down gracefully.
     pub(crate) shutdown: Arc<AtomicBool>,
     /// Set to true if there is un-synced WAL data in the buffer.
-    /// The background sync task checks this to avoid unnecessary fsync calls.
     wal_dirty: Arc<AtomicBool>,
     /// Notifies waiters when a background sync has completed.
     sync_notifier: Arc<tokio::sync::Notify>,
 }
 
 impl ApexEngine {
-    /// Opens the database at `path`, replaying WALs for crash recovery.
+    /// Opens the database at `path` with default configuration.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Arc<Self>> {
-        Self::open_with_policy(path, SyncPolicy::EveryWrite)
+        Self::open_with_config(path, ApexConfig::default())
     }
 
-    /// Opens the database with a specific WAL sync policy.
-    pub fn open_with_policy<P: AsRef<Path>>(path: P, sync_policy: SyncPolicy) -> Result<Arc<Self>> {
+    /// Opens the database with a specific configuration.
+    pub fn open_with_config<P: AsRef<Path>>(path: P, config: ApexConfig) -> Result<Arc<Self>> {
         let data_dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
@@ -122,35 +177,15 @@ impl ApexEngine {
         let immutable_memtables = Arc::new(ImmutableMemTables::new());
 
         // ---- Recover SSTables listed in the MANIFEST ----
-        let sstables = Self::recover_sstables(&data_dir, &manifest, table_cache.clone(), block_cache.clone())?;
+        let sstables = Self::recover_sstables(
+            &data_dir,
+            &manifest,
+            table_cache.clone(),
+            block_cache.clone(),
+        )?;
 
-
-        // ---- Replay WAL files not yet flushed to SSTables ----
         let active_memtable = Arc::new(MemTable::new());
-        let mut recovered_lsn: u64 = 0;
-
-        let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&data_dir) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                let name = fname.to_string_lossy();
-                if let Some(stem) = name.strip_suffix(".wal")
-                    && let Ok(id) = stem.parse::<u64>()
-                    && id >= manifest.wal_id
-                {
-                    wal_files.push((id, entry.path()));
-                }
-            }
-        }
-        wal_files.sort_by_key(|(id, _)| *id);
-
-        for (_wal_id, wal_path) in &wal_files {
-            let mut reader = WalReader::open(wal_path)?;
-            while let Some(record) = reader.next_record()? {
-                recovered_lsn = recovered_lsn.max(record.lsn + 1);
-                active_memtable.put(record.key, record.value, record.lsn);
-            }
-        }
+        let recovered_lsn = Self::replay_wal_files(&data_dir, &manifest, &active_memtable)?;
 
         // ---- Open a fresh WAL for new writes ----
         let wal_id = manifest.generate_file_id();
@@ -167,7 +202,7 @@ impl ApexEngine {
             data_dir,
             version_set: Arc::new(ArcSwap::from_pointee(Version {
                 active_memtable: active_memtable.clone(),
-                sstables: sstables.clone(),
+                levels: vec![sstables, Vec::new()], // Initialize with L0 from recovery
             })),
             manifest: Arc::new(Mutex::new(manifest)),
             wal: Arc::new(Mutex::new(wal)),
@@ -175,35 +210,73 @@ impl ApexEngine {
             table_cache,
             block_cache,
             next_lsn: AtomicU64::new(recovered_lsn),
-            sync_policy: sync_policy.clone(),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_ops)),
+            config: config.clone(),
             metrics,
             shutdown,
             wal_dirty,
             sync_notifier,
         });
 
-        // ---- Spawn background sync task if Delayed ----
-        if let SyncPolicy::Delayed(interval) = &sync_policy {
+        Self::spawn_background_tasks(&engine);
+
+        Ok(engine)
+    }
+
+    fn replay_wal_files(data_dir: &Path, manifest: &Manifest, memtable: &MemTable) -> Result<u64> {
+        let mut recovered_lsn = 0;
+        let mut wal_files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".wal")
+                    && let Ok(id) = stem.parse::<u64>()
+                    && id >= manifest.wal_id
+                {
+                    wal_files.push((id, entry.path()));
+                }
+            }
+        }
+        wal_files.sort_by_key(|(id, _)| *id);
+
+        for (_, wal_path) in &wal_files {
+            let mut reader = WalReader::open(wal_path)?;
+            while let Some(record) = reader.next_record()? {
+                recovered_lsn = recovered_lsn.max(record.lsn + 1);
+                memtable.put(record.key, record.value, record.lsn);
+            }
+        }
+        Ok(recovered_lsn)
+    }
+
+    fn spawn_background_tasks(engine: &Arc<Self>) {
+        if let SyncPolicy::Delayed(interval) = engine.config.sync_policy {
             let wal_ref = Arc::clone(&engine.wal);
             let dirty_ref = Arc::clone(&engine.wal_dirty);
             let shutdown_ref = Arc::clone(&engine.shutdown);
             let metrics_ref = Arc::clone(&engine.metrics);
             let notifier_ref = Arc::clone(&engine.sync_notifier);
-            let interval = *interval;
 
             tokio::spawn(async move {
-                Self::background_sync_loop(wal_ref, dirty_ref, shutdown_ref, metrics_ref, notifier_ref, interval)
-                    .await;
+                Self::background_sync_loop(
+                    wal_ref,
+                    dirty_ref,
+                    shutdown_ref,
+                    metrics_ref,
+                    notifier_ref,
+                    interval,
+                )
+                .await;
             });
         }
 
-        // ---- Spawn background compaction task ----
         let comp_version = Arc::clone(&engine.version_set);
         let comp_manifest = Arc::clone(&engine.manifest);
         let comp_cache = engine.block_cache.clone();
         let comp_table_cache = engine.table_cache.clone();
         let comp_dir = engine.data_dir.clone();
         let comp_shutdown = Arc::new(AtomicBool::new(false));
+        let comp_l0_threshold = engine.config.l0_compaction_threshold;
 
         tokio::spawn(async move {
             Self::compaction_loop(
@@ -213,11 +286,10 @@ impl ApexEngine {
                 comp_table_cache,
                 comp_cache,
                 comp_shutdown,
+                comp_l0_threshold,
             )
             .await;
         });
-
-        Ok(engine)
     }
 
     fn startup_gc(data_dir: &Path, manifest: &Manifest) -> Result<()> {
@@ -236,14 +308,16 @@ impl ApexEngine {
             if name.ends_with(".sst") {
                 if let Some(id_str) = name.strip_suffix(".sst")
                     && let Ok(id) = id_str.parse::<u64>()
-                    && !active_ssts.contains(&id) {
+                    && !active_ssts.contains(&id)
+                {
                     info!("Startup GC: Deleting zombie SSTable {name}");
                     let _ = std::fs::remove_file(&path);
                 }
             } else if name.ends_with(".wal") {
                 if let Some(id_str) = name.strip_suffix(".wal")
                     && let Ok(id) = id_str.parse::<u64>()
-                    && id < manifest.wal_id {
+                    && id < manifest.wal_id
+                {
                     info!("Startup GC: Deleting obsolete WAL {name}");
                     let _ = std::fs::remove_file(&path);
                 }
@@ -279,17 +353,23 @@ impl ApexEngine {
 
     /// Creates a point-in-time snapshot of the current version.
     /// This snapshot will remain valid even if compaction deletes files.
-    pub fn snapshot(self: &Arc<Self>) -> Snapshot {
-        Snapshot {
+    pub fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
+        Ok(Snapshot {
             engine: Arc::clone(self),
             version: self.version_set.load_full(),
-        }
+        })
     }
 
     /// Returns true if the engine is overwhelmed with pending flushes.
     /// Used for network backpressure to slow down producers.
     pub fn is_saturated(&self) -> bool {
-        self.immutable_memtables.len() >= 5
+        let version = self.version_set.load();
+        self.immutable_memtables.len() >= self.config.immutable_memtable_threshold
+            || version.l0_count() >= self.config.l0_compaction_threshold
     }
 
     // -----------------------------------------------------------------------
@@ -352,8 +432,57 @@ impl ApexEngine {
 
     /// Applies a batch of operations atomically.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
         if batch.is_empty() {
             return Ok(());
+        }
+
+        // ---- Stalling Backpressure Loop ----
+        let mut backoff_ms = 10;
+        let start_stall = Instant::now();
+
+        // admission control stall loop
+        loop {
+            let imm_count = self.immutable_memtables.len();
+            let version = self.version_set.load();
+            let l0_count = version.l0_count();
+
+            // Check if we are below thresholds. If so, we can proceed.
+            if l0_count < self.config.l0_compaction_threshold
+                && imm_count < self.config.immutable_memtable_threshold
+            {
+                break;
+            }
+
+            // Record the stall event
+            self.metrics.record_stall();
+
+            if start_stall.elapsed() >= Duration::from_secs(5) {
+                // Final check before we give up, to avoid race conditions
+                let final_version = self.version_set.load();
+                let final_l0 = final_version.l0_count();
+                let final_imm = self.immutable_memtables.len();
+                if final_l0 < self.config.l0_compaction_threshold
+                    && final_imm < self.config.immutable_memtable_threshold
+                {
+                    break;
+                }
+
+                return Err(ApexError::EngineOverloaded(format!(
+                    "Engine saturated (L0: {}, Imm: {}) after {:?}",
+                    final_l0,
+                    final_imm,
+                    start_stall.elapsed()
+                )));
+            }
+
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+            // Exponential backoff: double the sleep, up to 500ms
+            backoff_ms = std::cmp::min(500, backoff_ms * 2);
         }
 
         // --- Phase 1: WAL append (under Mutex) ---
@@ -361,8 +490,10 @@ impl ApexEngine {
         let bytes_written;
         {
             let mut wal = self.wal.lock();
-            start_lsn = self.next_lsn.fetch_add(batch.len() as u64, Ordering::SeqCst);
-            
+            start_lsn = self
+                .next_lsn
+                .fetch_add(batch.len() as u64, Ordering::SeqCst);
+
             let mut total_bytes = 0;
             for (i, op) in batch.ops.iter().enumerate() {
                 let lsn = start_lsn + i as u64;
@@ -377,7 +508,7 @@ impl ApexEngine {
             }
             bytes_written = total_bytes;
 
-            match self.sync_policy {
+            match self.config.sync_policy {
                 SyncPolicy::EveryWrite => {
                     wal.sync()?;
                     self.metrics.record_wal_sync();
@@ -392,7 +523,7 @@ impl ApexEngine {
         self.metrics.record_wal_write(bytes_written);
 
         // If Delayed, wait for the background worker to sync
-        if let SyncPolicy::Delayed(_) = self.sync_policy {
+        if let SyncPolicy::Delayed(_) = self.config.sync_policy {
             self.sync_notifier.notified().await;
         }
 
@@ -402,10 +533,14 @@ impl ApexEngine {
             let lsn = start_lsn + i as u64;
             match op {
                 BatchOp::Put(k, v) => {
-                    version.active_memtable.put(k.clone(), EntryValue::Value(v.clone()), lsn);
+                    version
+                        .active_memtable
+                        .put(k.clone(), EntryValue::Value(v.clone()), lsn);
                 }
                 BatchOp::Delete(k) => {
-                    version.active_memtable.put(k.clone(), EntryValue::Tombstone, lsn);
+                    version
+                        .active_memtable
+                        .put(k.clone(), EntryValue::Tombstone, lsn);
                 }
             }
         }
@@ -417,7 +552,6 @@ impl ApexEngine {
 
         Ok(())
     }
-
 
     /// Explicitly flush the WAL buffer to disk.
     ///
@@ -461,7 +595,7 @@ impl ApexEngine {
             let current_version = self.version_set.load();
             let new_version = Version {
                 active_memtable: Arc::new(MemTable::new()),
-                sstables: current_version.sstables.clone(),
+                levels: current_version.levels.clone(),
             };
             self.version_set.store(Arc::new(new_version));
 
@@ -522,17 +656,20 @@ impl ApexEngine {
 
         // 2. Commit SSTable to VersionSet (with atomic switch)
         let reader = SSTableReader::open(sst_id, table_cache, block_cache)?;
-        
-        // We use a simple loop for compare-and-swap if another thread (e.g. compaction) 
+
+        // We use a simple loop for compare-and-swap if another thread (e.g. compaction)
         // updated the version in the meantime.
         let mut current_version = version_arc.load();
         loop {
-            let mut new_sstables = current_version.sstables.clone();
-            new_sstables.push(Arc::new(reader.clone())); // reader cloning is cheap thanks to Arc inside
+            let mut new_levels = current_version.levels.clone();
+            if new_levels.is_empty() {
+                new_levels.push(Vec::new());
+            }
+            new_levels[0].push(Arc::new(reader.clone()));
 
             let new_version = Arc::new(Version {
                 active_memtable: Arc::clone(&current_version.active_memtable),
-                sstables: new_sstables,
+                levels: new_levels,
             });
 
             let prev = version_arc.compare_and_swap(&current_version, new_version);
@@ -562,6 +699,10 @@ impl ApexEngine {
     // -----------------------------------------------------------------------
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
         self.metrics.record_get();
 
         // 1. Active MemTable (lock-free)
@@ -581,13 +722,29 @@ impl ApexEngine {
             };
         }
 
-        // 3. SSTables (lock-free)
-        for reader in version.sstables.iter().rev() {
-            if let Some((val, _lsn)) = reader.get(key)? {
-                return match val {
-                    EntryValue::Value(v) => Ok(Some(v)),
-                    EntryValue::Tombstone => Ok(None),
-                };
+        // 3. Search L0 SSTables (newest first)
+        if let Some(l0) = version.levels.first() {
+            for reader in l0.iter().rev() {
+                if let Some((val, _lsn)) = reader.get(key)? {
+                    match val {
+                        EntryValue::Value(v) => return Ok(Some(v)),
+                        EntryValue::Tombstone => return Ok(None),
+                    }
+                }
+            }
+        }
+
+        // 4. Search L1+ SSTables
+        for level_idx in 1..version.levels.len() {
+            if let Some(readers) = version.levels.get(level_idx) {
+                for reader in readers {
+                    if let Some((val, _lsn)) = reader.get(key)? {
+                        match val {
+                            EntryValue::Value(v) => return Ok(Some(v)),
+                            EntryValue::Tombstone => return Ok(None),
+                        }
+                    }
+                }
             }
         }
 
@@ -597,6 +754,10 @@ impl ApexEngine {
     /// Performs a range scan, returning an async stream of key-value pairs.
     /// The stream is lazy and snapshot-consistent.
     pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanStream> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
         let version = self.version_set.load();
         self.create_scan_stream(version.clone(), start_key, Some(end_key))
     }
@@ -611,7 +772,9 @@ impl ApexEngine {
         let mut iterators: Vec<Box<dyn DbIterator>> = Vec::new();
 
         // 1. Active MemTable
-        iterators.push(Box::new(MemTableIterator::new(version.active_memtable.clone())));
+        iterators.push(Box::new(MemTableIterator::new(
+            version.active_memtable.clone(),
+        )));
 
         // 2. Immutable MemTables (if this is called from the engine, we use its snapshots)
         // If this is a snapshot scan, we should technically use the immutables from the snapshot point.
@@ -621,8 +784,10 @@ impl ApexEngine {
         }
 
         // 3. SSTables
-        for sst in &version.sstables {
-            iterators.push(Box::new(SSTableIterator::new(Arc::clone(sst))?));
+        for level in &version.levels {
+            for reader in level {
+                iterators.push(Box::new(SSTableIterator::new(Arc::clone(reader))?));
+            }
         }
 
         let mut merging_iter = MergingIterator::new(iterators)?;
@@ -638,6 +803,10 @@ impl ApexEngine {
     /// Manually triggers a flush of the current memtable to an SSTable on disk.
     /// Useful for testing and controlled persistence.
     pub fn force_flush(&self) -> Result<()> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
         self.trigger_flush()
     }
 
@@ -647,6 +816,10 @@ impl ApexEngine {
     ///
     /// This is a critical building block for Raft snapshotting.
     pub fn create_checkpoint<P: AsRef<Path>>(&self, checkpoint_path: P) -> Result<()> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
         let cp_path = checkpoint_path.as_ref();
         if cp_path.exists() {
             return Err(ApexError::Io(std::io::Error::new(
@@ -663,7 +836,7 @@ impl ApexEngine {
         // and prevent the compactor from deleting files we are about to link.
         let manifest = self.manifest.lock();
         let wal_id = manifest.wal_id;
-        
+
         // Collect all active SST IDs
         let mut active_ssts = Vec::new();
         for level_ssts in manifest.levels.values() {
@@ -684,7 +857,7 @@ impl ApexEngine {
         // 3. Hard-link MANIFEST
         tracing::debug!("Checkpoint: Hard-linking MANIFEST");
         std::fs::hard_link(self.data_dir.join("MANIFEST"), cp_path.join("MANIFEST"))?;
-        
+
         // Sync parent directory for checkpoint
         let cp_dir = File::open(cp_path)?;
         cp_dir.sync_all()?;
@@ -692,14 +865,14 @@ impl ApexEngine {
         // 4. Copy current WALs
         // We need all WALs from manifest.wal_id up to the current active WAL.
         let active_wal_id = self.wal.lock().id;
-        
+
         for id in wal_id..=active_wal_id {
             let name = format!("{id:06}.wal");
             let src = self.data_dir.join(&name);
             let dst = cp_path.join(&name);
-            
+
             if !src.exists() {
-                // It's possible some older WALs were already cleaned up if they 
+                // It's possible some older WALs were already cleaned up if they
                 // were flushed but the manifest watermark hasn't moved yet?
                 tracing::warn!("Checkpoint: Expected WAL {name} not found, skipping");
                 continue;
@@ -728,7 +901,7 @@ impl ApexEngine {
     /// 3. Synchronously flushes and closes the WAL.
     pub fn shutdown(&self) -> Result<()> {
         info!("Shutting down ApexEngine...");
-        
+
         // 1. Signal background tasks
         self.shutdown.store(true, Ordering::Release);
         self.sync_notifier.notify_waiters();
@@ -744,11 +917,10 @@ impl ApexEngine {
         let mut wal = self.wal.lock();
         wal.sync()?;
         info!("ApexEngine shutdown complete.");
-        
+
         Ok(())
     }
 }
-
 
 /// Graceful shutdown: signal the background sync task and perform a final
 /// WAL flush so no buffered writes are lost on a clean exit.
@@ -779,12 +951,29 @@ impl Snapshot {
             };
         }
 
-        for reader in self.version.sstables.iter().rev() {
-            if let Some((val, _lsn)) = reader.get(key)? {
-                return match val {
-                    EntryValue::Value(v) => Ok(Some(v)),
-                    EntryValue::Tombstone => Ok(None),
-                };
+        // Search L0 SSTables
+        if let Some(l0) = self.version.levels.first() {
+            for reader in l0.iter().rev() {
+                if let Some((val, _lsn)) = reader.get(key)? {
+                    match val {
+                        EntryValue::Value(v) => return Ok(Some(v)),
+                        EntryValue::Tombstone => return Ok(None),
+                    }
+                }
+            }
+        }
+
+        // Search L1+ SSTables
+        for level_idx in 1..self.version.levels.len() {
+            if let Some(readers) = self.version.levels.get(level_idx) {
+                for reader in readers {
+                    if let Some((val, _lsn)) = reader.get(key)? {
+                        match val {
+                            EntryValue::Value(v) => return Ok(Some(v)),
+                            EntryValue::Tombstone => return Ok(None),
+                        }
+                    }
+                }
             }
         }
 
@@ -793,6 +982,7 @@ impl Snapshot {
 
     /// Performs a range scan on this snapshot.
     pub fn scan(&self, start_key: Bytes, end_key: Bytes) -> Result<ScanStream> {
-        self.engine.create_scan_stream(self.version.clone(), start_key, Some(end_key))
+        self.engine
+            .create_scan_stream(self.version.clone(), start_key, Some(end_key))
     }
 }

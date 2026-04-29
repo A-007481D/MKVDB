@@ -1,10 +1,10 @@
 use crate::engine::ApexEngine;
+use crate::error::Result;
 use crate::network::resp::{RespCodec, RespValue};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
-use crate::error::Result;
 
 pub struct ApexServer {
     engine: Arc<ApexEngine>,
@@ -15,7 +15,11 @@ impl ApexServer {
         Self { engine }
     }
 
-    pub async fn run(&self, addr: &str, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(
+        &self,
+        addr: &str,
+        mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         tracing::info!("🚀 MKVDB Server listening on {}", addr);
 
@@ -44,14 +48,17 @@ impl ApexServer {
     async fn handle_connection(socket: TcpStream, engine: Arc<ApexEngine>) -> Result<()> {
         let mut framed = Framed::new(socket, RespCodec);
         let peer_addr = framed.get_ref().peer_addr().ok();
-        
+
         tracing::info!("New connection from {:?}", peer_addr);
 
         while let Some(request) = framed.next().await {
             // BACKPRESSURE: If the engine flusher is overwhelmed, stop reading from the socket.
             // This forces the client to slow down due to TCP window exhaustion.
             while engine.is_saturated() {
-                tracing::warn!("Engine is saturated, applying backpressure to {:?}", peer_addr);
+                tracing::warn!(
+                    "Engine is saturated, applying backpressure to {:?}",
+                    peer_addr
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
@@ -87,7 +94,9 @@ impl ApexServer {
         match cmd_name.as_str() {
             "SET" => {
                 if args.len() != 3 {
-                    return RespValue::Error("ERR wrong number of arguments for 'set' command".to_string());
+                    return RespValue::Error(
+                        "ERR wrong number of arguments for 'set' command".to_string(),
+                    );
                 }
                 let key = match &args[1] {
                     RespValue::BulkString(Some(b)) => b.clone(),
@@ -105,7 +114,9 @@ impl ApexServer {
             }
             "GET" => {
                 if args.len() != 2 {
-                    return RespValue::Error("ERR wrong number of arguments for 'get' command".to_string());
+                    return RespValue::Error(
+                        "ERR wrong number of arguments for 'get' command".to_string(),
+                    );
                 }
                 let key = match &args[1] {
                     RespValue::BulkString(Some(b)) => b,
@@ -120,7 +131,9 @@ impl ApexServer {
             }
             "DEL" => {
                 if args.len() != 2 {
-                    return RespValue::Error("ERR wrong number of arguments for 'del' command".to_string());
+                    return RespValue::Error(
+                        "ERR wrong number of arguments for 'del' command".to_string(),
+                    );
                 }
                 let key = match &args[1] {
                     RespValue::BulkString(Some(b)) => b.clone(),
@@ -155,7 +168,9 @@ impl ApexServer {
                                     results.push(RespValue::BulkString(Some(k)));
                                     results.push(RespValue::BulkString(Some(v)));
                                 }
-                                Err(e) => return RespValue::Error(format!("ERR scan error: {e:?}")),
+                                Err(e) => {
+                                    return RespValue::Error(format!("ERR scan error: {e:?}"));
+                                }
                             }
                         }
                         RespValue::Array(Some(results))

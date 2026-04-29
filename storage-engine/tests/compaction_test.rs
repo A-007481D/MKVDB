@@ -1,13 +1,13 @@
-use storage_engine::{ApexEngine, SyncPolicy};
-use futures_util::StreamExt;
 use bytes::Bytes;
-use tempfile::tempdir;
+use futures_util::StreamExt;
 use std::time::Duration;
+use storage_engine::ApexEngine;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn test_compaction_shrink() {
     let dir = tempdir().unwrap();
-    let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).unwrap();
+    let engine = ApexEngine::open(dir.path()).unwrap();
 
     // 1. Insert data and force flushes to create multiple L0 files
     for i in 0..5 {
@@ -27,7 +27,7 @@ async fn test_compaction_shrink() {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
             .count();
-        
+
         // We started with 5 files. After compaction, they should be merged into L1.
         // Depending on TARGET_SST_SIZE, it might be 1 or more, but definitely < 5.
         if sst_count < 5 && sst_count > 0 {
@@ -50,7 +50,7 @@ async fn test_compaction_shrink() {
 #[tokio::test]
 async fn test_ghost_read_concurrency() {
     let dir = tempdir().unwrap();
-    let engine = std::sync::Arc::new(ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).unwrap());
+    let engine = std::sync::Arc::new(ApexEngine::open(dir.path()).unwrap());
 
     // Populate some initial data
     for i in 0..100 {
@@ -61,10 +61,12 @@ async fn test_ghost_read_concurrency() {
     engine.force_flush().unwrap();
 
     let engine_cloned = engine.clone();
-    
+
     // Spawn a reader that performs a long scan
     let reader_handle = tokio::spawn(async move {
-        let mut scan = engine_cloned.scan(Bytes::from("key_000"), Bytes::from("key_099")).unwrap();
+        let mut scan = engine_cloned
+            .scan(Bytes::from("key_000"), Bytes::from("key_099"))
+            .unwrap();
         let mut count = 0;
         while let Some(res) = scan.next().await {
             let _ = res.unwrap();
@@ -94,10 +96,13 @@ async fn test_ghost_read_concurrency() {
 #[tokio::test]
 async fn test_tombstone_purge() {
     let dir = tempdir().unwrap();
-    let engine = ApexEngine::open_with_policy(dir.path(), SyncPolicy::EveryWrite).unwrap();
+    let engine = ApexEngine::open(dir.path()).unwrap();
 
     // 1. Insert a key
-    engine.put(Bytes::from("key_to_delete"), Bytes::from("value")).await.unwrap();
+    engine
+        .put(Bytes::from("key_to_delete"), Bytes::from("value"))
+        .await
+        .unwrap();
     engine.force_flush().unwrap();
 
     // 2. Delete the key
@@ -106,7 +111,10 @@ async fn test_tombstone_purge() {
 
     // 3. Trigger more flushes to ensure compaction triggers
     for i in 0..10 {
-        engine.put(Bytes::from(format!("other_{}", i)), Bytes::from("val")).await.unwrap();
+        engine
+            .put(Bytes::from(format!("other_{}", i)), Bytes::from("val"))
+            .await
+            .unwrap();
         engine.force_flush().unwrap();
     }
 
@@ -117,6 +125,8 @@ async fn test_tombstone_purge() {
     assert!(engine.get(b"key_to_delete").unwrap().is_none());
 
     // 6. Scan should not show it either
-    let mut scan = engine.scan(Bytes::from("key_"), Bytes::from("key_z")).unwrap();
+    let mut scan = engine
+        .scan(Bytes::from("key_"), Bytes::from("key_z"))
+        .unwrap();
     assert!(scan.next().await.is_none());
 }

@@ -136,7 +136,6 @@ impl SSTableReader {
             Err(idx) => idx - 1,
         };
 
-
         // 3. Block Cache lookup & verification
         let block = self.get_block(block_idx)?;
 
@@ -148,7 +147,7 @@ impl SSTableReader {
         if block_idx >= self.sparse_index.len() {
             return Err(ApexError::Corruption("Block index out of bounds".into()));
         }
-        
+
         let block_offset = self.sparse_index[block_idx].1;
         let next_offset = if block_idx + 1 < self.sparse_index.len() {
             self.sparse_index[block_idx + 1].1
@@ -159,7 +158,11 @@ impl SSTableReader {
         self.read_and_verify_block(block_offset, next_offset)
     }
 
-    fn read_and_verify_block(&self, block_offset: u64, next_block_offset: u64) -> Result<Arc<Block>> {
+    fn read_and_verify_block(
+        &self,
+        block_offset: u64,
+        next_block_offset: u64,
+    ) -> Result<Arc<Block>> {
         let cache_key = (self.id, block_offset);
         if let Some(b) = self.block_cache.get(&cache_key) {
             return Ok(b);
@@ -199,11 +202,19 @@ impl SSTableReader {
         let data_len = decompressed_data.len();
         while cursor < data_len {
             entry_offsets.push(cursor as u32);
-            if cursor + 4 > data_len { break; }
-            let key_len = u32::from_le_bytes(decompressed_data[cursor..cursor+4].try_into().unwrap()) as usize;
+            if cursor + 4 > data_len {
+                break;
+            }
+            let key_len =
+                u32::from_le_bytes(decompressed_data[cursor..cursor + 4].try_into().unwrap())
+                    as usize;
             cursor += 4 + key_len + 8 + 1; // KeyLen + Key + LSN + IsTombstone
-            if cursor + 4 > data_len { break; }
-            let val_len = u32::from_le_bytes(decompressed_data[cursor..cursor+4].try_into().unwrap()) as usize;
+            if cursor + 4 > data_len {
+                break;
+            }
+            let val_len =
+                u32::from_le_bytes(decompressed_data[cursor..cursor + 4].try_into().unwrap())
+                    as usize;
             cursor += 4 + val_len;
         }
 
@@ -218,18 +229,19 @@ impl SSTableReader {
     /// Binary search within a single data block for the target key.
     fn search_block(block: &Block, key: &[u8]) -> Option<(EntryValue, u64)> {
         let data = &block.data;
-        
+
         let result = block.entry_offsets.binary_search_by(|&offset| {
             let offset = offset as usize;
-            let key_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-            let entry_key = &data[offset+4..offset+4+key_len];
+            let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let entry_key = &data[offset + 4..offset + 4 + key_len];
             entry_key.cmp(key)
         });
 
         match result {
             Ok(idx) => {
                 let offset = block.entry_offsets[idx] as usize;
-                let key_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                let key_len =
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 let mut cursor = offset + 4 + key_len;
 
                 let lsn = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
@@ -238,7 +250,8 @@ impl SSTableReader {
                 let is_tombstone = data[cursor] == 1;
                 cursor += 1;
 
-                let val_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let val_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
 
                 let entry_val = if is_tombstone {
