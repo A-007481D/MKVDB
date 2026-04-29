@@ -35,7 +35,11 @@ impl WalWriter {
         let file_clone = file.try_clone()?;
 
         Ok(Self {
-            id: path_ref.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0),
+            id: path_ref
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             file: file_clone,
             writer: BufWriter::new(file),
             current_lsn: start_lsn,
@@ -103,7 +107,7 @@ impl WalReader {
         })
     }
 
-    /// Reads the next record from the WAL. Returns Ok(None) at EOF or if a 
+    /// Reads the next record from the WAL. Returns Ok(None) at EOF or if a
     /// partial "Torn Write" (including checksum mismatch at end-of-file) is detected.
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         let mut checksum_buf = [0u8; 4];
@@ -117,7 +121,7 @@ impl WalReader {
 
         // From this point on, if we hit UnexpectedEof, it's a "Torn Write"
         // (a record that was partially written when the power cut).
-        
+
         let mut lsn_buf = [0u8; 8];
         if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
             return Self::handle_eof(e);
@@ -173,8 +177,11 @@ impl WalReader {
             // If the checksum fails, we check if we are at the end of the file.
             // A torn write might have updated the checksum field but not the data,
             // or vice versa.
-            tracing::warn!("WAL Checksum mismatch: expected {}, found {}. Treating as Torn Write at end-of-log.", 
-                expected_checksum, actual_checksum);
+            tracing::warn!(
+                "WAL Checksum mismatch: expected {}, found {}. Treating as Torn Write at end-of-log.",
+                expected_checksum,
+                actual_checksum
+            );
             return Ok(None);
         }
 
@@ -187,9 +194,9 @@ impl WalReader {
 
     fn handle_eof(err: std::io::Error) -> Result<Option<WalRecord>> {
         if err.kind() == std::io::ErrorKind::UnexpectedEof {
-            // This is a Torn Write. We logged the checksum but the power 
-            // cut before the full payload was written. 
-            // We return Ok(None) to signal that recovery is finished 
+            // This is a Torn Write. We logged the checksum but the power
+            // cut before the full payload was written.
+            // We return Ok(None) to signal that recovery is finished
             // and we should truncate the log here.
             return Ok(None);
         }

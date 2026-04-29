@@ -25,7 +25,7 @@ impl SSTableBuilder {
     pub fn new<P: AsRef<Path>>(path: P, expected_keys: usize) -> Result<Self> {
         let target_path = path.as_ref().to_path_buf();
         let temp_path = target_path.with_extension("tmp");
-        
+
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -178,7 +178,7 @@ impl SSTableBuilder {
             let dir = File::open(parent)?;
             dir.sync_all()?;
         }
-        
+
         Ok(())
     }
 }

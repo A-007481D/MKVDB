@@ -1,5 +1,5 @@
-use storage_engine::ApexEngine;
 use std::path::Path;
+use storage_engine::ApexEngine;
 
 #[tokio::test]
 async fn run_forensic_audit() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +22,7 @@ async fn run_forensic_audit() -> Result<(), Box<dyn std::error::Error>> {
         Ok(e) => {
             println!("Success: Engine opened correctly. Atomic Manifest is VALID.");
             e
-        },
+        }
         Err(e) => {
             println!("FAILURE: Engine failed to open: {:?}", e);
             return Err(e.into());
@@ -32,22 +32,25 @@ async fn run_forensic_audit() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Verify WAL Replay (Audit Point 3)
     // The benchmark was writing keys like "key-0000000-000"
     println!("Step 2: Verifying data retrieval (WAL Replay Check)...");
-    
+
     // Let's check some keys from the middle of the range that should have been flushed/wal-ed
-    let test_keys = [
-        "key-0000000-000",
-        "key-0000100-500",
-        "key-0000500-250",
-    ];
+    let test_keys = ["key-0000000-000", "key-0000100-500", "key-0000500-250"];
 
     for key_str in test_keys {
         match engine.get(key_str.as_bytes()) {
             Ok(Some(val)) => {
-                println!("SUCCESS: Key '{}' found. Value size: {} bytes", key_str, val.len());
-            },
+                println!(
+                    "SUCCESS: Key '{}' found. Value size: {} bytes",
+                    key_str,
+                    val.len()
+                );
+            }
             Ok(None) => {
-                println!("WARNING: Key '{}' not found. Might have been lost in flight or never written.", key_str);
-            },
+                println!(
+                    "WARNING: Key '{}' not found. Might have been lost in flight or never written.",
+                    key_str
+                );
+            }
             Err(e) => {
                 println!("ERROR: Failed to get key '{}': {:?}", key_str, e);
             }

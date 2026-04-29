@@ -118,47 +118,47 @@ impl Manifest {
     }
 
     /// Rewrites the MANIFEST into a clean, collapsed state.
-    /// 
+    ///
     /// This uses the atomic swap pattern:
     /// 1. Write the current state to a temporary file.
     /// 2. Call fsync on the temp file.
     /// 3. Atomically rename the temp file to the target MANIFEST.
-    /// 
-    /// This ensures that even a crash during checkpointing leaves us with 
+    ///
+    /// This ensures that even a crash during checkpointing leaves us with
     /// either the old full history or the new collapsed state.
     pub fn checkpoint(&mut self) -> Result<()> {
         let temp_path = self.path.with_extension("tmp");
         {
             let mut temp_file = File::create(&temp_path)?;
-            
+
             // Write WAL ID
             temp_file.write_all(format!("WAL,{}\n", self.wal_id).as_bytes())?;
-            
+
             // Write all active tables
             for (level, sst_ids) in &self.levels {
                 for &id in sst_ids {
                     temp_file.write_all(format!("ADD,{level},{id}\n").as_bytes())?;
                 }
             }
-            
+
             temp_file.sync_all()?;
         }
 
         // Atomic swap
         std::fs::rename(&temp_path, &self.path)?;
-        
+
         // Sync parent directory to ensure the rename is durable
         if let Some(parent) = self.path.parent() {
             let dir = File::open(parent)?;
             dir.sync_all()?;
         }
-        
+
         // Re-open the file handle in append mode
         self.file = OpenOptions::new()
             .append(true)
             .read(true)
             .open(&self.path)?;
-            
+
         Ok(())
     }
 

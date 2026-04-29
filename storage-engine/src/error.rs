@@ -17,6 +17,9 @@ pub enum ApexError {
 
     #[error("Data corruption: {0}")]
     Corruption(String),
+
+    #[error("Engine overloaded: {0}")]
+    EngineOverloaded(String),
 }
 
 pub type Result<T> = std::result::Result<T, ApexError>;
