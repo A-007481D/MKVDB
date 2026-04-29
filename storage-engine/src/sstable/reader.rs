@@ -13,6 +13,7 @@ const MAGIC_NUMBER: u64 = 0xA9E8_D8B1_7F1A_2B3C;
 #[derive(Clone)]
 pub struct Block {
     pub data: Bytes,
+    pub entry_offsets: Vec<u32>,
 }
 
 /// A reader for an on-disk SSTable file.
@@ -192,68 +193,63 @@ impl SSTableReader {
         let decompressed_data = lz4_flex::decompress_size_prepended(compressed_data)
             .map_err(|e| ApexError::Corruption(format!("Lz4 decompression failed: {e}")))?;
 
+        // Index the block entries for binary search
+        let mut entry_offsets = Vec::new();
+        let mut cursor = 0;
+        let data_len = decompressed_data.len();
+        while cursor < data_len {
+            entry_offsets.push(cursor as u32);
+            if cursor + 4 > data_len { break; }
+            let key_len = u32::from_le_bytes(decompressed_data[cursor..cursor+4].try_into().unwrap()) as usize;
+            cursor += 4 + key_len + 8 + 1; // KeyLen + Key + LSN + IsTombstone
+            if cursor + 4 > data_len { break; }
+            let val_len = u32::from_le_bytes(decompressed_data[cursor..cursor+4].try_into().unwrap()) as usize;
+            cursor += 4 + val_len;
+        }
+
         let b = Arc::new(Block {
             data: Bytes::from(decompressed_data),
+            entry_offsets,
         });
         self.block_cache.insert(cache_key, Arc::clone(&b));
         Ok(b)
     }
 
-    /// Linear scan within a single data block for the target key.
+    /// Binary search within a single data block for the target key.
     fn search_block(block: &Block, key: &[u8]) -> Option<(EntryValue, u64)> {
-        let mut cursor = 0;
         let data = &block.data;
+        
+        let result = block.entry_offsets.binary_search_by(|&offset| {
+            let offset = offset as usize;
+            let key_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let entry_key = &data[offset+4..offset+4+key_len];
+            entry_key.cmp(key)
+        });
 
-        while cursor < data.len() {
-            if cursor + 4 > data.len() {
-                break;
+        match result {
+            Ok(idx) => {
+                let offset = block.entry_offsets[idx] as usize;
+                let key_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                let mut cursor = offset + 4 + key_len;
+
+                let lsn = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                cursor += 8;
+
+                let is_tombstone = data[cursor] == 1;
+                cursor += 1;
+
+                let val_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+
+                let entry_val = if is_tombstone {
+                    EntryValue::Tombstone
+                } else {
+                    let v = &data[cursor..cursor + val_len];
+                    EntryValue::Value(Bytes::copy_from_slice(v))
+                };
+                Some((entry_val, lsn))
             }
-
-            let key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-
-            if cursor + key_len > data.len() {
-                break;
-            }
-            let entry_key = &data[cursor..cursor + key_len];
-            cursor += key_len;
-
-            if cursor + 8 > data.len() {
-                break;
-            }
-            let lsn = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-
-            if cursor + 1 > data.len() {
-                break;
-            }
-            let is_tombstone = data[cursor] == 1;
-            cursor += 1;
-
-            if cursor + 4 > data.len() {
-                break;
-            }
-            let val_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-
-            let entry_val = if is_tombstone {
-                EntryValue::Tombstone
-            } else {
-                if cursor + val_len > data.len() {
-                    break;
-                }
-                let v = &data[cursor..cursor + val_len];
-                cursor += val_len;
-                EntryValue::Value(Bytes::copy_from_slice(v))
-            };
-
-            match entry_key.cmp(key) {
-                std::cmp::Ordering::Equal => return Some((entry_val, lsn)),
-                std::cmp::Ordering::Greater => return None,
-                std::cmp::Ordering::Less => {}
-            }
+            Err(_) => None,
         }
-
-        None
     }
 }
