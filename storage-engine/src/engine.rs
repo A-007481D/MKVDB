@@ -852,7 +852,10 @@ impl ApexEngine {
             }
 
             // Copy MANIFEST while holding the lock
-            std::fs::copy(self.data_dir.join("MANIFEST"), checkpoint_path.join("MANIFEST"))?;
+            std::fs::copy(
+                self.data_dir.join("MANIFEST"),
+                checkpoint_path.join("MANIFEST"),
+            )?;
 
             // Capture WAL state
             let (active_id, current_size) = {
