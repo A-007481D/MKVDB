@@ -1,4 +1,5 @@
 use crate::engine::ApexEngine;
+use crate::engine::Version;
 use crate::error::Result;
 use crate::iterator::{DbIterator, MergingIterator};
 use crate::manifest::{Manifest, ManifestEvent};
@@ -6,13 +7,12 @@ use crate::sstable::builder::SSTableBuilder;
 use crate::sstable::iterator::SSTableIterator;
 use crate::sstable::reader::{Block, SSTableReader};
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use parking_lot::Mutex;
-use crate::engine::Version;
-use std::path::{Path, PathBuf};
 use moka::sync::Cache;
+use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 const TARGET_SST_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -25,6 +25,7 @@ impl ApexEngine {
         table_cache: crate::sstable::cache::TableCache,
         block_cache: Cache<(u64, u64), Arc<Block>>,
         shutdown: Arc<AtomicBool>,
+        l0_threshold: usize,
     ) {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -39,6 +40,7 @@ impl ApexEngine {
                 &manifest,
                 &table_cache,
                 &block_cache,
+                l0_threshold,
             ) {
                 eprintln!("Compaction error: {e:?}");
             }
@@ -52,22 +54,33 @@ impl ApexEngine {
         manifest_arc: &Arc<Mutex<Manifest>>,
         table_cache: &crate::sstable::cache::TableCache,
         block_cache: &Cache<(u64, u64), Arc<Block>>,
+        l0_threshold: usize,
     ) -> Result<()> {
-        let l0_ids: Vec<u64>;
-        let l1_ids: Vec<u64>;
+        let current_version = version_arc.load();
+        // Pick L0 files from the CURRENT VERSION
+        let l0_ids: Vec<u64> = current_version
+            .levels
+            .first()
+            .map(|l0| l0.iter().map(|s| s.id).take(10).collect())
+            .unwrap_or_default();
 
-        {
-            let manifest_guard = manifest_arc.lock();
-            let l0 = manifest_guard.levels.get(&0).cloned().unwrap_or_default();
-            
-            // Only trigger if L0 > 4 files
-            if l0.len() <= 4 {
-                return Ok(());
-            }
-
-            l0_ids = l0.into_iter().collect();
-            l1_ids = manifest_guard.levels.get(&1).cloned().unwrap_or_default().into_iter().collect();
+        if l0_ids.len() < l0_threshold {
+            return Ok(());
         }
+
+        // For simplicity in this version, we still get L1 IDs from manifest or just assume
+        // we merge all L0s into a new set of L1s.
+        // Real implementation would pick overlapping L1s.
+        let l1_ids: Vec<u64> = {
+            let manifest_guard = manifest_arc.lock();
+            manifest_guard
+                .levels
+                .get(&1)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
 
         tracing::info!(
             "Starting L0->L1 compaction: merging {} L0 files and {} L1 files",
@@ -75,15 +88,19 @@ impl ApexEngine {
             l1_ids.len()
         );
 
-        let current_version = version_arc.load();
-        
         let mut compact_readers = Vec::new();
-        let mut remaining_sstables = Vec::new();
-        for reader in &current_version.sstables {
-            if l0_ids.contains(&reader.id) || l1_ids.contains(&reader.id) {
-                compact_readers.push(Arc::clone(reader));
-            } else {
-                remaining_sstables.push(Arc::clone(reader));
+        if let Some(l0) = current_version.levels.first() {
+            for reader in l0 {
+                if l0_ids.contains(&reader.id) {
+                    compact_readers.push(Arc::clone(reader));
+                }
+            }
+        }
+        if let Some(l1) = current_version.levels.get(1) {
+            for reader in l1 {
+                if l1_ids.contains(&reader.id) {
+                    compact_readers.push(Arc::clone(reader));
+                }
             }
         }
 
@@ -96,6 +113,7 @@ impl ApexEngine {
 
         // Execute Compaction Job
         let mut new_l1_ids = Vec::new();
+        let mut new_readers_inner = Vec::new();
         let mut current_builder: Option<SSTableBuilder> = None;
         let mut current_id = 0;
         let mut current_path = PathBuf::new();
@@ -119,9 +137,12 @@ impl ApexEngine {
             // --- TOMBSTONE GC ---
             // A tombstone can only be purged if we are merging into the bottom-most level.
             // In our current 2-level system, L1 is the floor.
-            let is_bottom_level = true; 
+            let is_bottom_level = true;
             if !val.is_tombstone() || !is_bottom_level {
-                current_builder.as_mut().unwrap().add(key.as_ref(), &val, lsn)?;
+                current_builder
+                    .as_mut()
+                    .unwrap()
+                    .add(key.as_ref(), &val, lsn)?;
             } else {
                 tracing::debug!("Tombstone GC: dropping key {:?}", key);
             }
@@ -129,8 +150,9 @@ impl ApexEngine {
             if current_builder.as_ref().unwrap().estimated_size() > TARGET_SST_SIZE as u64 {
                 let builder = current_builder.take().unwrap();
                 builder.finish()?;
-                let reader = SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
-                remaining_sstables.push(Arc::new(reader));
+                let reader =
+                    SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
+                new_readers_inner.push(Arc::new(reader));
             }
 
             merging_iter.next()?;
@@ -139,8 +161,9 @@ impl ApexEngine {
         if let Some(builder) = current_builder {
             if builder.estimated_size() > 0 {
                 builder.finish()?;
-                let reader = SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
-                remaining_sstables.push(Arc::new(reader));
+                let reader =
+                    SSTableReader::open(current_id, table_cache.clone(), block_cache.clone())?;
+                new_readers_inner.push(Arc::new(reader));
             } else {
                 // Remove empty file
                 let _ = std::fs::remove_file(&current_path);
@@ -148,25 +171,27 @@ impl ApexEngine {
             }
         }
 
-        // --- Commit Compaction ---
-        // 1. Update Version (CAS loop)
+        let new_readers = new_readers_inner;
+
+        // 2. Update Version (CAS loop)
         loop {
             let curr = version_arc.load();
-            let mut final_sstables = remaining_sstables.clone();
-            
-            // Re-add SSTables that were added by concurrent flushes
-            for sst in &curr.sstables {
-                if !l0_ids.contains(&sst.id) && 
-                   !l1_ids.contains(&sst.id) && 
-                   !new_l1_ids.contains(&sst.id) 
-                {
-                    final_sstables.push(Arc::clone(sst));
-                }
+            let mut new_levels = curr.levels.clone();
+
+            // 1. Remove processed L0 files
+            if let Some(l0) = new_levels.get_mut(0) {
+                l0.retain(|s| !l0_ids.contains(&s.id));
             }
+
+            // 2. Replace L1 files (for now we merge all L1, so we just replace the whole level)
+            if new_levels.len() < 2 {
+                new_levels.push(Vec::new());
+            }
+            new_levels[1].clone_from(&new_readers);
 
             let new_version = Arc::new(Version {
                 active_memtable: Arc::clone(&curr.active_memtable),
-                sstables: final_sstables,
+                levels: new_levels,
             });
 
             let prev = version_arc.compare_and_swap(&curr, new_version);
@@ -187,7 +212,7 @@ impl ApexEngine {
             for id in &new_l1_ids {
                 manifest_guard.log_event(ManifestEvent::AddTable { level: 1, id: *id })?;
             }
-            
+
             // Harden the manifest by checkpointing
             if let Err(e) = manifest_guard.checkpoint() {
                 tracing::warn!("Manifest checkpoint failed: {:?}", e);
@@ -201,7 +226,10 @@ impl ApexEngine {
             let _ = std::fs::remove_file(path);
         }
 
-        tracing::info!("L0->L1 compaction completed successfully. New L1 files: {:?}", new_l1_ids);
+        tracing::info!(
+            "L0->L1 compaction completed successfully. New L1 files: {:?}",
+            new_l1_ids
+        );
         Ok(())
     }
 }
