@@ -9,7 +9,8 @@ use openraft::{
 };
 use std::fmt;
 use std::sync::Arc;
-use tonic::{Request, Response, Status, transport::Channel};
+use std::time::Duration;
+use tonic::{Request, Response, Status, codec::CompressionEncoding, transport::Channel};
 
 // Generated gRPC code from proto/raft.proto
 pub mod raft_proto {
@@ -63,6 +64,14 @@ pub struct ApexRaftServer {
 impl ApexRaftServer {
     pub fn new(raft: Arc<openraft::Raft<ApexRaftTypeConfig>>) -> Self {
         Self { raft }
+    }
+
+    /// Converts this server into a gRPC service that can be served.
+    /// Enables production-grade compression settings (Gzip).
+    pub fn into_grpc_service(self) -> raft_proto::raft_service_server::RaftServiceServer<Self> {
+        raft_proto::raft_service_server::RaftServiceServer::new(self)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip)
     }
 }
 
@@ -258,9 +267,18 @@ impl RaftNetworkFactory<ApexRaftTypeConfig> for ApexRaftNetworkFactory {
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
         let addr = format!("http://{}", node.addr);
-        let endpoint = tonic::transport::Endpoint::from_shared(addr).expect("Invalid URI");
+        let endpoint = tonic::transport::Endpoint::from_shared(addr)
+            .expect("Invalid URI")
+            .timeout(Duration::from_millis(1000))
+            .connect_timeout(Duration::from_millis(500))
+            .tcp_keepalive(Some(Duration::from_secs(15)))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+
         let channel = endpoint.connect_lazy();
-        let client = RaftServiceClient::new(channel);
+        let client = RaftServiceClient::new(channel)
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip);
 
         ApexRaftNetworkConnection {
             target,
