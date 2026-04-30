@@ -821,7 +821,7 @@ impl ApexEngine {
     /// active WAL are copied to ensure the checkpoint is immutable and consistent.
     ///
     /// This is a critical building block for Raft snapshotting.
-    pub async fn create_checkpoint(&self, checkpoint_path: &Path) -> Result<()> {
+    pub fn create_checkpoint(&self, checkpoint_path: &Path) -> Result<()> {
         let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
             ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
         })?;
