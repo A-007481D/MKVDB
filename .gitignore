@@ -29,3 +29,6 @@ Thumbs.db
 *.sst
 MANIFEST
 data/
+
+# Project State
+docs/PROJECT_STATE.md
