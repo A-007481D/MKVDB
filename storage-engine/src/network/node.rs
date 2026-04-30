@@ -1,14 +1,50 @@
 use std::sync::Arc;
+use std::time::Duration;
 use openraft::{Raft, Config};
 use crate::engine::ApexEngine;
+use crate::iterator::ScanStream;
 use crate::network::grpc::{ApexRaftNetworkFactory, ApexRaftServer, ApexRaftTypeConfig};
 use crate::network::storage::ApexRaftStorage;
 use tonic::transport::Server;
 use anyhow::Result;
+use bytes::Bytes;
+use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+use openraft::BasicNode;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub enum RaftCommand {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteRedirect {
+    Leader(String),
+    UnknownLeader,
+}
+
+/// Error type for read operations that go through the Raft linearizability
+/// barrier. On non-leader nodes, a redirect is returned so the RESP server
+/// can issue a MOVED response.
+#[derive(Debug)]
+pub enum ReadError {
+    Redirect(WriteRedirect),
+    Storage(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redirect(r) => write!(f, "redirect: {r:?}"),
+            Self::Storage(s) => write!(f, "storage error: {s}"),
+        }
+    }
+}
 
 /// ApexNode is the primary entry point for a distributed MKVDB node.
 /// It bundles the LSM-Tree engine, the Raft consensus instance, and the gRPC server.
 pub struct ApexNode {
+    pub node_id: u64,
     pub raft: Raft<ApexRaftTypeConfig>,
     pub engine: Arc<ApexEngine>,
 }
@@ -62,26 +98,107 @@ impl ApexNode {
                 .expect("Failed to start Raft gRPC server");
         });
 
-        Ok(Self { raft, engine })
+        Ok(Self {
+            node_id,
+            raft,
+            engine,
+        })
     }
 
-    /// Helper to submit a write command to the cluster.
-    pub async fn write(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        // For now, we just pass the raw bytes. In a real system,
-        // we'd have a Command enum (Put, Delete, etc.)
-        let payload = bincode::serialize(&(key, value))?;
-        self.raft.client_write(payload).await?;
+    fn map_forwarded_leader(leader: &ForwardToLeader<u64, BasicNode>) -> WriteRedirect {
+        if let Some(node) = &leader.leader_node {
+            return WriteRedirect::Leader(node.addr.clone());
+        }
+        WriteRedirect::UnknownLeader
+    }
+
+    /// Waits until this node is a stable leader and has at least one committed/applied log.
+    /// This barrier is required before performing config changes in tests/orchestration.
+    pub async fn await_config_change_ready(&self, timeout: Duration) -> Result<()> {
+        self.raft
+            .wait(Some(timeout))
+            .current_leader(self.node_id, "wait for current leader")
+            .await?;
+        self.raft
+            .wait(Some(timeout))
+            .applied_index_at_least(Some(1), "wait for first committed/applied entry")
+            .await?;
         Ok(())
     }
 
-    /// Helper to read data with linearizability guarantees.
-    /// This ensures we don't return stale data by confirming leadership with a quorum.
-    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Confirm we are still the leader and have a current view of the cluster state.
-        self.raft.ensure_linearizable().await?;
-        
-        // After confirmation, reading from the local engine is safe for linearizability.
-        let val = self.engine.get(key)?;
+    /// Appends a noop-equivalent command and waits for it to commit/apply.
+    /// We use a reserved key prefix so the entry is observable and deterministic.
+    pub async fn commit_noop_barrier(&self) -> Result<(), WriteRedirect> {
+        let key = format!("__raft_barrier__:{}", self.node_id).into_bytes();
+        self.write_put(key, b"1".to_vec()).await
+    }
+
+    async fn write_command(&self, command: RaftCommand) -> Result<(), WriteRedirect> {
+        let payload = bincode::serialize(&command).map_err(|_| WriteRedirect::UnknownLeader)?;
+        match self.raft.client_write(payload).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(leader))) => {
+                Err(Self::map_forwarded_leader(&leader))
+            }
+            Err(_) => Err(WriteRedirect::UnknownLeader),
+        }
+    }
+
+    /// Helper to submit a PUT command to the cluster.
+    pub async fn write_put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), WriteRedirect> {
+        self.write_command(RaftCommand::Put(key, value)).await
+    }
+
+    /// Helper to submit a DELETE command to the cluster.
+    pub async fn write_delete(&self, key: Vec<u8>) -> Result<(), WriteRedirect> {
+        self.write_command(RaftCommand::Delete(key)).await
+    }
+
+    /// Reads a key with linearizability guarantees.
+    ///
+    /// Confirms leadership with a quorum via `ensure_linearizable()` before
+    /// reading the local engine. The `data:` keyspace prefix is applied
+    /// automatically — callers pass the user-facing key.
+    pub async fn read(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, ReadError> {
+        self.raft.ensure_linearizable().await.map_err(|_e| {
+            ReadError::Redirect(WriteRedirect::UnknownLeader)
+        })?;
+
+        let mut data_key = Vec::with_capacity(5 + key.len());
+        data_key.extend_from_slice(b"data:");
+        data_key.extend_from_slice(key);
+
+        let val = self.engine.get(&data_key).map_err(|e| {
+            ReadError::Storage(format!("{e:?}"))
+        })?;
         Ok(val.map(|b| b.to_vec()))
+    }
+
+    /// Performs a range scan with linearizability guarantees.
+    ///
+    /// Confirms leadership with a quorum via `ensure_linearizable()` before
+    /// scanning the local engine. The `data:` keyspace prefix is applied
+    /// automatically — callers pass user-facing keys.
+    pub async fn scan(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> std::result::Result<ScanStream, ReadError> {
+        self.raft.ensure_linearizable().await.map_err(|_| {
+            ReadError::Redirect(WriteRedirect::UnknownLeader)
+        })?;
+
+        let mut prefixed_start = Vec::with_capacity(5 + start_key.len());
+        prefixed_start.extend_from_slice(b"data:");
+        prefixed_start.extend_from_slice(start_key);
+
+        let mut prefixed_end = Vec::with_capacity(5 + end_key.len());
+        prefixed_end.extend_from_slice(b"data:");
+        prefixed_end.extend_from_slice(end_key);
+
+        self.engine.scan(
+            Bytes::from(prefixed_start),
+            Bytes::from(prefixed_end),
+        ).map_err(|e| ReadError::Storage(format!("{e:?}")))
     }
 }

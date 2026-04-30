@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use storage_engine::engine::{ApexConfig, ApexEngine, SyncPolicy};
-use storage_engine::network::ApexServer;
+use storage_engine::network::{ApexNode, ApexServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,8 +27,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let engine = ApexEngine::open_with_config(data_dir, config)?;
 
-    // Initialize the RESP Server
-    let server = ApexServer::new(Arc::clone(&engine));
+    let node_id = if let Some(pos) = args.iter().position(|a| a == "--node-id") {
+        args.get(pos + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let raft_bind_addr = if let Some(pos) = args.iter().position(|a| a == "--raft-addr") {
+        args.get(pos + 1)
+            .map(|s| s.as_str())
+            .unwrap_or("127.0.0.1:50051")
+    } else {
+        "127.0.0.1:50051"
+    };
+
+    // Initialize the Raft node and the client server.
+    let node = Arc::new(ApexNode::start(node_id, raft_bind_addr, Arc::clone(&engine)).await?);
+    let server = ApexServer::new(Arc::clone(&engine), node);
 
     // Setup graceful shutdown channel
     let (tx, rx) = tokio::sync::oneshot::channel();
