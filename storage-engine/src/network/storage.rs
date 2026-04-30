@@ -100,10 +100,31 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e)
         })?;
 
-        let last_log_id = last_id_raw
+        let mut last_log_id = last_id_raw
             .map(|d| bincode::deserialize::<LogId<u64>>(&d))
             .transpose()
             .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+
+        // Fallback: If metadata is missing but logs exist, scan for the last log
+        if last_log_id.is_none() {
+            let mut stream = self.engine.scan(
+                Bytes::from_static(b"log:"),
+                Bytes::from_static(b"log:\xFF"),
+            ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            
+            let mut max_entry: Option<Entry<ApexRaftTypeConfig>> = None;
+            while let Some(res) = stream.next().await {
+                let (_, val) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+                let entry: Entry<ApexRaftTypeConfig> = bincode::deserialize(&val)
+                    .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+                max_entry = Some(entry);
+            }
+            
+            if let Some(entry) = max_entry {
+                tracing::info!("RaftStorage: Recovered last_log_id from WAL: {:?}", entry.log_id);
+                last_log_id = Some(entry.log_id);
+            }
+        }
 
         let last_purged_raw = self.engine.get(b"meta:last_purged_log_id").map_err(|e| {
             Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e)
@@ -168,6 +189,23 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
         })?;
 
+        // CRITICAL VERIFICATION: Ensure the write is actually visible to subsequent reads
+        if let Some(expected_id) = last_log_id {
+            let actual_id_raw = self.engine.get(b"meta:last_log_id")
+                .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            
+            let actual_id: Option<LogId<u64>> = actual_id_raw
+                .map(|d| bincode::deserialize(&d))
+                .transpose()
+                .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                
+            if actual_id != Some(expected_id) {
+                let msg = format!("RaftStorage persistence mismatch! Expected last_log_id {:?}, found {:?}", expected_id, actual_id);
+                tracing::error!("{}", msg);
+                return Err(StorageError::write_logs(anyhow::anyhow!(msg)));
+            }
+        }
+
         callback.log_io_completed(Ok(()));
 
         Ok(())
@@ -219,7 +257,7 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let start_key = format!("log:{:020}", 0);
-        let end_key = format!("log:{:020}", log_id.index);
+        let end_key = format!("log:{:020}", log_id.index + 1);
 
         let mut stream = self.engine.scan(
             Bytes::copy_from_slice(start_key.as_bytes()),
