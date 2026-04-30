@@ -26,7 +26,6 @@ impl ApexNode {
 
         // 2. Initialize ApexRaftStorage (the storage adapter)
         let storage = ApexRaftStorage::new(engine.clone());
-        let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
 
         // 3. Configure and initialize the openraft::Raft instance
         let config = Config {
@@ -42,8 +41,8 @@ impl ApexNode {
             node_id,
             Arc::new(config),
             network_factory,
-            log_store,
-            state_machine,
+            storage.clone(),
+            storage,
         )
         .await?;
 
