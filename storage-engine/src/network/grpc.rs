@@ -1,5 +1,5 @@
 use openraft::{
-    BasicNode, CommittedLeaderId, LogId, RaftTypeConfig,
+    BasicNode, CommittedLeaderId, LogId, RaftTypeConfig, StoredMembership,
     error::{InstallSnapshotError, NetworkError, RPCError, RaftError},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
@@ -55,9 +55,44 @@ impl RaftTypeConfig for ApexRaftTypeConfig {
     type Responder = openraft::impls::OneshotResponder<ApexRaftTypeConfig>;
 }
 
-// --- 2. gRPC Server Implementation ---
+// --- 2. Protocol Conversion Helpers ---
 
-/// The gRPC server that receives Raft RPCs and forwards them to the local Raft instance.
+impl From<openraft::Vote<u64>> for raft_proto::Vote {
+    fn from(v: openraft::Vote<u64>) -> Self {
+        Self {
+            term: v.leader_id.term,
+            node_id: v.leader_id.node_id,
+            committed: v.committed,
+        }
+    }
+}
+
+impl From<raft_proto::Vote> for openraft::Vote<u64> {
+    fn from(v: raft_proto::Vote) -> Self {
+        let mut vote = openraft::Vote::new(v.term, v.node_id);
+        vote.committed = v.committed;
+        vote
+    }
+}
+
+impl From<openraft::LogId<u64>> for raft_proto::LogId {
+    fn from(id: openraft::LogId<u64>) -> Self {
+        Self {
+            term: id.leader_id.term,
+            node_id: id.leader_id.node_id,
+            index: id.index,
+        }
+    }
+}
+
+impl From<raft_proto::LogId> for openraft::LogId<u64> {
+    fn from(id: raft_proto::LogId) -> Self {
+        openraft::LogId::new(CommittedLeaderId::new(id.term, id.node_id), id.index)
+    }
+}
+
+// --- 3. gRPC Server Implementation ---
+
 pub struct ApexRaftServer {
     raft: Arc<openraft::Raft<ApexRaftTypeConfig>>,
 }
@@ -67,8 +102,6 @@ impl ApexRaftServer {
         Self { raft }
     }
 
-    /// Converts this server into a gRPC service that can be served.
-    /// Enables production-grade compression settings (Gzip).
     pub fn into_grpc_service(self) -> raft_proto::raft_service_server::RaftServiceServer<Self> {
         raft_proto::raft_service_server::RaftServiceServer::new(self)
             .accept_compressed(CompressionEncoding::Gzip)
@@ -83,105 +116,47 @@ impl RaftService for ApexRaftServer {
         request: Request<raft_proto::AppendEntriesRequest>,
     ) -> Result<Response<raft_proto::AppendEntriesResponse>, Status> {
         let req = request.into_inner();
-
-        let leader_id = req
-            .leader_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("Invalid leader_id"))?;
-
+        
         let raft_req = AppendEntriesRequest {
-            vote: openraft::Vote::new(req.term, leader_id),
-            prev_log_id: if req.prev_log_index > 0 {
-                Some(LogId::new(
-                    CommittedLeaderId::new(req.prev_log_term, leader_id),
-                    req.prev_log_index,
-                ))
-            } else {
-                None
-            },
+            vote: req.vote.map(Into::into).ok_or_else(|| Status::invalid_argument("missing vote"))?,
+            prev_log_id: req.prev_log_id.map(Into::into),
             entries: {
-                let mut decoded_entries = Vec::with_capacity(req.entries.len());
+                let mut decoded = Vec::with_capacity(req.entries.len());
                 for e in req.entries {
-                    let log_id = LogId::new(CommittedLeaderId::new(e.term, leader_id), e.index);
+                    let log_id = e.log_id.map(Into::into).ok_or_else(|| Status::invalid_argument("missing log_id"))?;
                     let payload = match raft_proto::EntryType::try_from(e.entry_type) {
                         Ok(raft_proto::EntryType::Blank) => openraft::EntryPayload::Blank,
                         Ok(raft_proto::EntryType::Membership) => {
-                            let membership: openraft::Membership<u64, BasicNode> =
-                                bincode::deserialize(&e.data)
-                                    .map_err(|err| Status::internal(format!("Failed to deserialize membership: {err}")))?;
-                            openraft::EntryPayload::Membership(membership)
+                            let m = bincode::deserialize(&e.data)
+                                .map_err(|err| Status::internal(format!("membership decode error: {err}")))?;
+                            openraft::EntryPayload::Membership(m)
                         }
                         _ => openraft::EntryPayload::Normal(e.data),
                     };
-                    decoded_entries.push(openraft::Entry { log_id, payload });
+                    decoded.push(openraft::Entry { log_id, payload });
                 }
-                decoded_entries
+                decoded
             },
-            leader_commit: if req.leader_commit > 0 {
-                Some(LogId::new(
-                    CommittedLeaderId::new(req.term, leader_id),
-                    req.leader_commit,
-                ))
-            } else {
-                None
-            },
+            leader_commit: req.leader_commit.map(Into::into),
         };
 
-        let resp = self
-            .raft
-            .append_entries(raft_req)
-            .await
+        let resp = self.raft.append_entries(raft_req).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        match resp {
-            AppendEntriesResponse::Success => {
-                Ok(Response::new(raft_proto::AppendEntriesResponse {
-                    term: req.term,
-                    success: true,
-                    conflict_index: 0,
-                    conflict_term: 0,
-                    last_log_index: 0,
-                    higher_vote: None,
-                    is_conflict: false,
-                }))
-            }
-            AppendEntriesResponse::PartialSuccess(log_id) => {
-                Ok(Response::new(raft_proto::AppendEntriesResponse {
-                    term: req.term,
-                    success: true,
-                    conflict_index: 0,
-                    conflict_term: 0,
-                    last_log_index: log_id.map_or(0, |id| id.index),
-                    higher_vote: None,
-                    is_conflict: false,
-                }))
-            }
-            AppendEntriesResponse::Conflict => {
-                Ok(Response::new(raft_proto::AppendEntriesResponse {
-                    term: req.term,
-                    success: false,
-                    conflict_index: 0,
-                    conflict_term: 0,
-                    last_log_index: 0,
-                    higher_vote: None,
-                    is_conflict: true,
-                }))
-            }
-            AppendEntriesResponse::HigherVote(vote) => {
-                Ok(Response::new(raft_proto::AppendEntriesResponse {
-                    term: vote.leader_id.term,
-                    success: false,
-                    conflict_index: 0,
-                    conflict_term: 0,
-                    last_log_index: 0,
-                    higher_vote: Some(raft_proto::HigherVote {
-                        term: vote.leader_id.term,
-                        node_id: vote.leader_id.node_id,
-                    }),
-                    is_conflict: false,
-                }))
-            }
-        }
+        let (success, conflict_log_id) = match resp {
+            AppendEntriesResponse::Success => (true, None),
+            AppendEntriesResponse::PartialSuccess(id) => (true, id),
+            AppendEntriesResponse::Conflict => (false, None),
+            AppendEntriesResponse::HigherVote(_) => (false, None),
+        };
+
+        let current_metrics = self.raft.metrics().borrow().clone();
+
+        Ok(Response::new(raft_proto::AppendEntriesResponse {
+            vote: Some(current_metrics.vote.into()),
+            success,
+            conflict_log_id: conflict_log_id.map(Into::into),
+        }))
     }
 
     async fn request_vote(
@@ -189,31 +164,16 @@ impl RaftService for ApexRaftServer {
         request: Request<raft_proto::RequestVoteRequest>,
     ) -> Result<Response<raft_proto::RequestVoteResponse>, Status> {
         let req = request.into_inner();
-        let candidate_id = req
-            .candidate_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("Invalid candidate_id"))?;
-
         let raft_req = VoteRequest {
-            vote: openraft::Vote::new(req.term, candidate_id),
-            last_log_id: if req.last_log_index > 0 {
-                Some(LogId::new(
-                    CommittedLeaderId::new(req.last_log_term, candidate_id),
-                    req.last_log_index,
-                ))
-            } else {
-                None
-            },
+            vote: req.vote.map(Into::into).ok_or_else(|| Status::invalid_argument("missing vote"))?,
+            last_log_id: req.last_log_id.map(Into::into),
         };
 
-        let resp = self
-            .raft
-            .vote(raft_req)
-            .await
+        let resp = self.raft.vote(raft_req).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(raft_proto::RequestVoteResponse {
-            term: resp.vote.leader_id.term,
+            vote: Some(resp.vote.into()),
             vote_granted: resp.vote_granted,
         }))
     }
@@ -223,51 +183,35 @@ impl RaftService for ApexRaftServer {
         request: Request<raft_proto::InstallSnapshotRequest>,
     ) -> Result<Response<raft_proto::InstallSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let leader_id = req
-            .leader_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("Invalid leader_id"))?;
+        let vote = req.vote.clone().map(Into::into).ok_or_else(|| Status::invalid_argument("missing vote"))?;
+        let last_log_id = req.last_log_id.map(Into::into).ok_or_else(|| Status::invalid_argument("missing last_log_id"))?;
 
         let raft_req = InstallSnapshotRequest {
-            vote: openraft::Vote::new(req.term, leader_id),
+            vote,
             meta: openraft::SnapshotMeta {
-                last_log_id: Some(LogId::new(
-                    CommittedLeaderId::new(req.last_included_term, leader_id),
-                    req.last_included_index,
-                )),
-                last_membership: openraft::StoredMembership::new(
-                    None,
-                    openraft::Membership::new(
-                        vec![std::collections::BTreeSet::from_iter(vec![leader_id])],
-                        None,
-                    ),
-                ),
-                snapshot_id: format!("{}-{}-{}", req.term, leader_id, req.offset),
+                last_log_id: Some(last_log_id),
+                last_membership: StoredMembership::new(Some(last_log_id), openraft::Membership::new(vec![std::collections::BTreeSet::new()], None)),
+                snapshot_id: "snapshot".to_string(),
             },
-            offset: req.offset,
+            offset: 0,
             data: req.data,
             done: req.done,
         };
 
-        let resp = self
-            .raft
-            .install_snapshot(raft_req)
-            .await
+        let resp = self.raft.install_snapshot(raft_req).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(raft_proto::InstallSnapshotResponse {
-            term: resp.vote.leader_id.term,
+            vote: Some(resp.vote.into()),
         }))
     }
 }
 
-// --- 3. gRPC Network Client Implementation ---
+// --- 4. gRPC Network Client Implementation ---
 
 #[derive(Clone)]
 pub struct ApexRaftNetworkConnection {
     target: u64,
-    #[allow(dead_code)]
-    target_node: BasicNode,
     client: RaftServiceClient<Channel>,
 }
 
@@ -280,21 +224,12 @@ impl RaftNetworkFactory<ApexRaftTypeConfig> for ApexRaftNetworkFactory {
         let addr = format!("http://{}", node.addr);
         let endpoint = tonic::transport::Endpoint::from_shared(addr)
             .expect("Invalid URI")
-            .timeout(Duration::from_secs(1))
-            .connect_timeout(Duration::from_millis(500))
-            .tcp_keepalive(Some(Duration::from_secs(15)))
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-
-        let channel = endpoint.connect_lazy();
-        let client = RaftServiceClient::new(channel)
-            .send_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Gzip);
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(2));
 
         ApexRaftNetworkConnection {
             target,
-            target_node: node.clone(),
-            client,
+            client: RaftServiceClient::new(endpoint.connect_lazy()),
         }
     }
 }
@@ -306,67 +241,37 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let mut client = self.client.clone();
-
+        
         let proto_req = raft_proto::AppendEntriesRequest {
-            term: rpc.vote.leader_id.term,
-            leader_id: rpc.vote.leader_id.node_id.to_string(),
-            prev_log_index: rpc.prev_log_id.map_or(0, |id| id.index),
-            prev_log_term: rpc.prev_log_id.map_or(0, |id| id.leader_id.term),
-            entries: rpc
-                .entries
-                .into_iter()
-                .map(|e| {
-                    let (data, entry_type) = match e.payload {
-                        openraft::EntryPayload::Normal(data) => {
-                            (data, raft_proto::EntryType::Normal as i32)
-                        }
-                        openraft::EntryPayload::Blank => {
-                            (vec![], raft_proto::EntryType::Blank as i32)
-                        }
-                        openraft::EntryPayload::Membership(ref m) => {
-                            let serialized = bincode::serialize(m)
-                                .expect("membership serialization cannot fail");
-                            (serialized, raft_proto::EntryType::Membership as i32)
-                        }
-                    };
-                    raft_proto::LogEntry {
-                        index: e.log_id.index,
-                        term: e.log_id.leader_id.term,
-                        data,
-                        entry_type,
-                    }
-                })
-                .collect(),
-            leader_commit: rpc.leader_commit.map_or(0, |id| id.index),
+            vote: Some(rpc.vote.into()),
+            prev_log_id: rpc.prev_log_id.map(Into::into),
+            entries: rpc.entries.into_iter().map(|e| {
+                let (data, entry_type) = match e.payload {
+                    openraft::EntryPayload::Normal(d) => (d, raft_proto::EntryType::Normal as i32),
+                    openraft::EntryPayload::Blank => (vec![], raft_proto::EntryType::Blank as i32),
+                    openraft::EntryPayload::Membership(ref m) => (bincode::serialize(m).unwrap(), raft_proto::EntryType::Membership as i32),
+                };
+                raft_proto::LogEntry {
+                    log_id: Some(e.log_id.into()),
+                    data,
+                    entry_type,
+                }
+            }).collect(),
+            leader_commit: rpc.leader_commit.map(Into::into),
         };
 
-        let response = client
-            .append_entries(proto_req)
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let resp = response.into_inner();
-
-        if resp.is_conflict {
-            return Ok(AppendEntriesResponse::Conflict);
-        }
-
-        if let Some(ref higher) = resp.higher_vote {
-            return Ok(AppendEntriesResponse::HigherVote(openraft::Vote::new(
-                higher.term,
-                higher.node_id,
-            )));
-        }
+        let resp = client.append_entries(proto_req).await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
+            .into_inner();
 
         if resp.success {
-            if resp.last_log_index > 0 {
-                Ok(AppendEntriesResponse::PartialSuccess(Some(LogId::new(
-                    CommittedLeaderId::new(resp.term, self.target),
-                    resp.last_log_index,
-                ))))
+            if let Some(id) = resp.conflict_log_id {
+                Ok(AppendEntriesResponse::PartialSuccess(Some(id.into())))
             } else {
                 Ok(AppendEntriesResponse::Success)
             }
+        } else if let Some(vote) = resp.vote {
+            Ok(AppendEntriesResponse::HigherVote(vote.into()))
         } else {
             Ok(AppendEntriesResponse::Conflict)
         }
@@ -376,34 +281,22 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         &mut self,
         rpc: InstallSnapshotRequest<ApexRaftTypeConfig>,
         _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
-    > {
+    ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>> {
         let mut client = self.client.clone();
-
         let proto_req = raft_proto::InstallSnapshotRequest {
-            term: rpc.vote.leader_id.term,
-            leader_id: rpc.vote.leader_id.node_id.to_string(),
-            last_included_index: rpc.meta.last_log_id.map_or(0, |id| id.index),
-            last_included_term: rpc
-                .meta
-                .last_log_id
-                .map_or(0, |id| id.leader_id.term),
-            offset: rpc.offset,
+            vote: Some(rpc.vote.into()),
+            last_log_id: rpc.meta.last_log_id.map(Into::into),
             data: rpc.data,
+            offset: rpc.offset,
             done: rpc.done,
         };
 
-        let response = client
-            .install_snapshot(proto_req)
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let resp = response.into_inner();
+        let resp = client.install_snapshot(proto_req).await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
+            .into_inner();
 
         Ok(InstallSnapshotResponse {
-            vote: openraft::Vote::new(resp.term, self.target),
+            vote: resp.vote.map(Into::into).unwrap_or_else(|| openraft::Vote::new(0, self.target)),
         })
     }
 
@@ -413,23 +306,18 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let mut client = self.client.clone();
-
         let proto_req = raft_proto::RequestVoteRequest {
-            term: rpc.vote.leader_id.term,
-            candidate_id: rpc.vote.leader_id.node_id.to_string(),
-            last_log_index: rpc.last_log_id.map_or(0, |id| id.index),
-            last_log_term: rpc.last_log_id.map_or(0, |id| id.leader_id.term),
+            vote: Some(rpc.vote.into()),
+            last_log_id: rpc.last_log_id.map(Into::into),
         };
 
-        let response = client
-            .request_vote(proto_req)
-            .await
+        let response = client.request_vote(proto_req).await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
+        
         let resp = response.into_inner();
 
         Ok(VoteResponse {
-            vote: openraft::Vote::new(resp.term, self.target),
+            vote: resp.vote.map(Into::into).unwrap_or_else(|| openraft::Vote::new(0, self.target)),
             vote_granted: resp.vote_granted,
             last_log_id: rpc.last_log_id,
         })
