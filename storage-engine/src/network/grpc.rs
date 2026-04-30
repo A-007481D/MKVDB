@@ -13,6 +13,7 @@ use std::time::Duration;
 use tonic::{Request, Response, Status, codec::CompressionEncoding, transport::Channel};
 
 // Generated gRPC code from proto/raft.proto
+#[allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
 pub mod raft_proto {
     tonic::include_proto!("raft");
 }
@@ -140,7 +141,7 @@ impl RaftService for ApexRaftServer {
                     success: true,
                     conflict_index: 0,
                     conflict_term: 0,
-                    last_log_index: log_id.map(|id| id.index).unwrap_or(0),
+                    last_log_index: log_id.map_or(0, |id| id.index),
                     higher_vote: None,
                     is_conflict: false,
                 }))
@@ -269,7 +270,7 @@ impl RaftNetworkFactory<ApexRaftTypeConfig> for ApexRaftNetworkFactory {
         let addr = format!("http://{}", node.addr);
         let endpoint = tonic::transport::Endpoint::from_shared(addr)
             .expect("Invalid URI")
-            .timeout(Duration::from_millis(1000))
+            .timeout(Duration::from_secs(1))
             .connect_timeout(Duration::from_millis(500))
             .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(10))
@@ -299,8 +300,8 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         let proto_req = raft_proto::AppendEntriesRequest {
             term: rpc.vote.leader_id.term,
             leader_id: rpc.vote.leader_id.node_id.to_string(),
-            prev_log_index: rpc.prev_log_id.map(|id| id.index).unwrap_or(0),
-            prev_log_term: rpc.prev_log_id.map(|id| id.leader_id.term).unwrap_or(0),
+            prev_log_index: rpc.prev_log_id.map_or(0, |id| id.index),
+            prev_log_term: rpc.prev_log_id.map_or(0, |id| id.leader_id.term),
             entries: rpc
                 .entries
                 .into_iter()
@@ -313,7 +314,7 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
                     },
                 })
                 .collect(),
-            leader_commit: rpc.leader_commit.map(|id| id.index).unwrap_or(0),
+            leader_commit: rpc.leader_commit.map_or(0, |id| id.index),
         };
 
         let response = client
@@ -361,12 +362,11 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         let proto_req = raft_proto::InstallSnapshotRequest {
             term: rpc.vote.leader_id.term,
             leader_id: rpc.vote.leader_id.node_id.to_string(),
-            last_included_index: rpc.meta.last_log_id.map(|id| id.index).unwrap_or(0),
+            last_included_index: rpc.meta.last_log_id.map_or(0, |id| id.index),
             last_included_term: rpc
                 .meta
                 .last_log_id
-                .map(|id| id.leader_id.term)
-                .unwrap_or(0),
+                .map_or(0, |id| id.leader_id.term),
             offset: rpc.offset,
             data: rpc.data,
             done: rpc.done,
@@ -394,8 +394,8 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         let proto_req = raft_proto::RequestVoteRequest {
             term: rpc.vote.leader_id.term,
             candidate_id: rpc.vote.leader_id.node_id.to_string(),
-            last_log_index: rpc.last_log_id.map(|id| id.index).unwrap_or(0),
-            last_log_term: rpc.last_log_id.map(|id| id.leader_id.term).unwrap_or(0),
+            last_log_index: rpc.last_log_id.map_or(0, |id| id.index),
+            last_log_term: rpc.last_log_id.map_or(0, |id| id.leader_id.term),
         };
 
         let response = client
