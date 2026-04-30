@@ -74,9 +74,13 @@ impl ApexNode {
         Ok(())
     }
 
-    /// Helper to read data from the local engine.
-    /// In a linearizable system, we might want to route this through Raft.
-    pub fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Helper to read data with linearizability guarantees.
+    /// This ensures we don't return stale data by confirming leadership with a quorum.
+    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Confirm we are still the leader and have a current view of the cluster state.
+        self.raft.ensure_linearizable().await?;
+        
+        // After confirmation, reading from the local engine is safe for linearizability.
         let val = self.engine.get(key)?;
         Ok(val.map(|b| b.to_vec()))
     }
