@@ -2,68 +2,57 @@ syntax = "proto3";
 
 package raft;
 
-// Raft consensus service for internal node-to-node communication.
 service RaftService {
-    // Invoked by leader to replicate log entries; also used as heartbeat.
-    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-
-    // Invoked by candidates to gather votes.
-    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
-
-    // Invoked by leader to send a snapshot to a follower.
-    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
-}
-
-// --- AppendEntries ---
-
-message AppendEntriesRequest {
-    uint64 term = 1;
-    string leader_id = 2;
-    uint64 prev_log_index = 3;
-    uint64 prev_log_term = 4;
-    repeated LogEntry entries = 5;
-    uint64 leader_commit = 6;
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 message LogEntry {
-    uint64 index = 1;
-    uint64 term = 2;
-    bytes data = 3; // Serialized command
+  uint64 index = 1;
+  uint64 term = 2;
+  bytes data = 3;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
 }
 
 message AppendEntriesResponse {
-    uint64 term = 1;
-    bool success = 2;
-    uint64 conflict_index = 3;
-    uint64 conflict_term = 4;
+  uint64 term = 1;
+  bool success = 2;
+  uint64 conflict_index = 3;
+  uint64 conflict_term = 4;
+  uint64 last_log_index = 5; // For PartialSuccess
 }
 
-// --- RequestVote ---
-
 message RequestVoteRequest {
-    uint64 term = 1;
-    string candidate_id = 2;
-    uint64 last_log_index = 3;
-    uint64 last_log_term = 4;
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
 }
 
 message RequestVoteResponse {
-    uint64 term = 1;
-    bool vote_granted = 2;
+  uint64 term = 1;
+  bool vote_granted = 2;
 }
 
-// --- InstallSnapshot ---
-
 message InstallSnapshotRequest {
-    uint64 term = 1;
-    string leader_id = 2;
-    uint64 last_included_index = 3;
-    uint64 last_included_term = 4;
-    bytes data = 5; // Snapshot chunk
-    uint64 offset = 6;
-    bool done = 7;
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool done = 7;
 }
 
 message InstallSnapshotResponse {
-    uint64 term = 1;
+  uint64 term = 1;
 }
