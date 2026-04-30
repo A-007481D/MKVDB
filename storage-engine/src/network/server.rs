@@ -1,5 +1,6 @@
 use crate::engine::ApexEngine;
 use crate::error::Result;
+use crate::network::node::{ApexNode, ReadError, WriteRedirect};
 use crate::network::resp::{RespCodec, RespValue};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -8,11 +9,12 @@ use tokio_util::codec::Framed;
 
 pub struct ApexServer {
     engine: Arc<ApexEngine>,
+    node: Arc<ApexNode>,
 }
 
 impl ApexServer {
-    pub fn new(engine: Arc<ApexEngine>) -> Self {
-        Self { engine }
+    pub fn new(engine: Arc<ApexEngine>, node: Arc<ApexNode>) -> Self {
+        Self { engine, node }
     }
 
     pub async fn run(
@@ -28,9 +30,10 @@ impl ApexServer {
                 accept_res = listener.accept() => {
                     let (socket, _) = accept_res?;
                     let engine = self.engine.clone();
+                    let node = self.node.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(socket, engine).await {
+                        if let Err(e) = Self::handle_connection(socket, engine, node).await {
                             tracing::error!("Connection error: {:?}", e);
                         }
                     });
@@ -45,7 +48,11 @@ impl ApexServer {
         Ok(())
     }
 
-    async fn handle_connection(socket: TcpStream, engine: Arc<ApexEngine>) -> Result<()> {
+    async fn handle_connection(
+        socket: TcpStream,
+        engine: Arc<ApexEngine>,
+        node: Arc<ApexNode>,
+    ) -> Result<()> {
         let mut framed = Framed::new(socket, RespCodec);
         let peer_addr = framed.get_ref().peer_addr().ok();
 
@@ -67,7 +74,7 @@ impl ApexServer {
 
             let response = match request {
                 RespValue::Array(Some(mut args)) if !args.is_empty() => {
-                    Self::dispatch_command(&engine, &mut args).await
+                    Self::dispatch_command(&node, &mut args).await
                 }
                 RespValue::SimpleString(s) if s.to_uppercase() == "PING" => {
                     RespValue::SimpleString("PONG".to_string())
@@ -85,7 +92,24 @@ impl ApexServer {
         Ok(())
     }
 
-    async fn dispatch_command(engine: &Arc<ApexEngine>, args: &mut [RespValue]) -> RespValue {
+    fn moved_error(redirect: WriteRedirect) -> RespValue {
+        match redirect {
+            WriteRedirect::Leader(addr) => RespValue::Error(format!("MOVED {addr}")),
+            WriteRedirect::UnknownLeader => RespValue::Error("MOVED unknown".to_string()),
+        }
+    }
+
+    fn read_error(err: ReadError) -> RespValue {
+        match err {
+            ReadError::Redirect(r) => Self::moved_error(r),
+            ReadError::Storage(s) => RespValue::Error(format!("ERR storage error: {s}")),
+        }
+    }
+
+    async fn dispatch_command(
+        node: &Arc<ApexNode>,
+        args: &mut [RespValue],
+    ) -> RespValue {
         let cmd_name = match &args[0] {
             RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_uppercase(),
             _ => return RespValue::Error("ERR invalid command format".to_string()),
@@ -107,9 +131,9 @@ impl ApexServer {
                     _ => return RespValue::Error("ERR invalid value".to_string()),
                 };
 
-                match engine.put(key, val).await {
+                match node.write_put(key.to_vec(), val.to_vec()).await {
                     Ok(_) => RespValue::SimpleString("OK".to_string()),
-                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
+                    Err(redirect) => Self::moved_error(redirect),
                 }
             }
             "GET" => {
@@ -123,10 +147,11 @@ impl ApexServer {
                     _ => return RespValue::Error("ERR invalid key".to_string()),
                 };
 
-                match engine.get(key) {
-                    Ok(Some(val)) => RespValue::BulkString(Some(val)),
+                // All reads go through Raft linearizability barrier.
+                match node.read(key).await {
+                    Ok(Some(val)) => RespValue::BulkString(Some(val.into())),
                     Ok(None) => RespValue::BulkString(None), // Nil
-                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
+                    Err(e) => Self::read_error(e),
                 }
             }
             "DEL" => {
@@ -140,9 +165,9 @@ impl ApexServer {
                     _ => return RespValue::Error("ERR invalid key".to_string()),
                 };
 
-                match engine.delete(key).await {
+                match node.write_delete(key.to_vec()).await {
                     Ok(_) => RespValue::Integer(1),
-                    Err(e) => RespValue::Error(format!("ERR storage error: {e:?}")),
+                    Err(redirect) => Self::moved_error(redirect),
                 }
             }
             "SCAN" => {
@@ -159,13 +184,20 @@ impl ApexServer {
                     _ => return RespValue::Error("ERR invalid end_key".to_string()),
                 };
 
-                match engine.scan(start, end) {
+                // All scans go through Raft linearizability barrier.
+                match node.scan(&start, &end).await {
                     Ok(mut stream) => {
                         let mut results = Vec::new();
                         while let Some(res) = stream.next().await {
                             match res {
                                 Ok((k, v)) => {
-                                    results.push(RespValue::BulkString(Some(k)));
+                                    // Strip the "data:" prefix from keys before returning
+                                    let user_key = if k.starts_with(b"data:") {
+                                        k.slice(5..)
+                                    } else {
+                                        k
+                                    };
+                                    results.push(RespValue::BulkString(Some(user_key)));
                                     results.push(RespValue::BulkString(Some(v)));
                                 }
                                 Err(e) => {
@@ -175,7 +207,7 @@ impl ApexServer {
                         }
                         RespValue::Array(Some(results))
                     }
-                    Err(e) => RespValue::Error(format!("ERR scan error: {e:?}")),
+                    Err(e) => Self::read_error(e),
                 }
             }
             "PING" => RespValue::SimpleString("PONG".to_string()),

@@ -99,14 +99,24 @@ impl RaftService for ApexRaftServer {
             } else {
                 None
             },
-            entries: req
-                .entries
-                .into_iter()
-                .map(|e| openraft::Entry {
-                    log_id: LogId::new(CommittedLeaderId::new(e.term, leader_id), e.index),
-                    payload: openraft::EntryPayload::Normal(e.data),
-                })
-                .collect(),
+            entries: {
+                let mut decoded_entries = Vec::with_capacity(req.entries.len());
+                for e in req.entries {
+                    let log_id = LogId::new(CommittedLeaderId::new(e.term, leader_id), e.index);
+                    let payload = match raft_proto::EntryType::try_from(e.entry_type) {
+                        Ok(raft_proto::EntryType::Blank) => openraft::EntryPayload::Blank,
+                        Ok(raft_proto::EntryType::Membership) => {
+                            let membership: openraft::Membership<u64, BasicNode> =
+                                bincode::deserialize(&e.data)
+                                    .map_err(|err| Status::internal(format!("Failed to deserialize membership: {err}")))?;
+                            openraft::EntryPayload::Membership(membership)
+                        }
+                        _ => openraft::EntryPayload::Normal(e.data),
+                    };
+                    decoded_entries.push(openraft::Entry { log_id, payload });
+                }
+                decoded_entries
+            },
             leader_commit: if req.leader_commit > 0 {
                 Some(LogId::new(
                     CommittedLeaderId::new(req.term, leader_id),
@@ -305,13 +315,26 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
             entries: rpc
                 .entries
                 .into_iter()
-                .map(|e| raft_proto::LogEntry {
-                    index: e.log_id.index,
-                    term: e.log_id.leader_id.term,
-                    data: match e.payload {
-                        openraft::EntryPayload::Normal(data) => data,
-                        _ => vec![],
-                    },
+                .map(|e| {
+                    let (data, entry_type) = match e.payload {
+                        openraft::EntryPayload::Normal(data) => {
+                            (data, raft_proto::EntryType::Normal as i32)
+                        }
+                        openraft::EntryPayload::Blank => {
+                            (vec![], raft_proto::EntryType::Blank as i32)
+                        }
+                        openraft::EntryPayload::Membership(ref m) => {
+                            let serialized = bincode::serialize(m)
+                                .expect("membership serialization cannot fail");
+                            (serialized, raft_proto::EntryType::Membership as i32)
+                        }
+                    };
+                    raft_proto::LogEntry {
+                        index: e.log_id.index,
+                        term: e.log_id.leader_id.term,
+                        data,
+                        entry_type,
+                    }
                 })
                 .collect(),
             leader_commit: rpc.leader_commit.map_or(0, |id| id.index),

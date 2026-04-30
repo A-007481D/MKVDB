@@ -1,16 +1,22 @@
 use std::sync::Arc;
 use std::ops::RangeBounds;
-use std::path::Path;
 use bytes::Bytes;
-use openraft::{
-    storage::{LogState, RaftLogReader, RaftStorage, Snapshot, RaftSnapshotBuilder},
-    LogId, StorageError, StorageIOError, StoredMembership, Vote, OptionalSend,
-    SnapshotMeta, BasicNode,
-};
-use crate::error::ApexError;
+use crate::batch::WriteBatch;
 use crate::engine::ApexEngine;
+use crate::network::node::RaftCommand;
+use futures_util::StreamExt;
+use openraft::{
+    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
+    Snapshot, SnapshotMeta, StorageError, StorageIOError,
+    Vote, BasicNode, StoredMembership, ErrorSubject, ErrorVerb, AnyError,
+};
+use openraft::storage::{RaftLogStorage, RaftStateMachine, LogFlushed};
+use openraft::storage::SnapshotSignature;
+use std::io::Cursor;
 use crate::network::grpc::ApexRaftTypeConfig;
 
+/// ApexRaftStorage bridges the ApexEngine KV store with the OpenRaft consensus engine.
+/// It implements all mandatory storage traits for Raft 0.9.x.
 #[derive(Clone)]
 pub struct ApexRaftStorage {
     pub engine: Arc<ApexEngine>,
@@ -21,20 +27,23 @@ impl ApexRaftStorage {
         Self { engine }
     }
 
-    fn log_key(index: u64) -> Vec<u8> {
-        let mut key = b"log:".to_vec();
-        key.extend_from_slice(&index.to_be_bytes());
-        key
+    /// Helper to convert engine errors to Raft storage errors.
+    fn map_io_err<E: std::error::Error + Send + Sync + 'static>(
+        subject: ErrorSubject<u64>,
+        verb: ErrorVerb,
+        err: E,
+    ) -> StorageError<u64> {
+        StorageError::IO {
+            source: StorageIOError::new(subject, verb, AnyError::new(&err)),
+        }
     }
 
-    fn map_engine_error(e: ApexError) -> StorageError<u64> {
-        let err = std::io::Error::other(e.to_string());
-        StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                &err,
-            ),
+    /// Internal helper to get a snapshot signature for error reporting.
+    fn get_signature(meta: &SnapshotMeta<u64, BasicNode>) -> SnapshotSignature<u64> {
+        SnapshotSignature {
+            last_log_id: meta.last_log_id,
+            last_membership_log_id: *meta.last_membership.log_id(),
+            snapshot_id: meta.snapshot_id.clone(),
         }
     }
 }
@@ -43,302 +52,438 @@ impl RaftLogReader<ApexRaftTypeConfig> for ApexRaftStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<openraft::Entry<ApexRaftTypeConfig>>, StorageError<u64>> {
+    ) -> Result<Vec<Entry<ApexRaftTypeConfig>>, StorageError<u64>> {
         let start = match range.start_bound() {
             std::ops::Bound::Included(&i) => i,
             std::ops::Bound::Excluded(&i) => i + 1,
             std::ops::Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&i) => i + 1,
-            std::ops::Bound::Excluded(&i) => i,
+            std::ops::Bound::Included(&i) => i,
+            std::ops::Bound::Excluded(&i) => i.saturating_sub(1),
             std::ops::Bound::Unbounded => u64::MAX,
         };
 
-        let mut entries = Vec::new();
-        for index in start..end {
-            let key = Self::log_key(index);
-            let val = self.engine.get(&key).map_err(Self::map_engine_error)?;
-            if let Some(data) = val {
-                let entry: openraft::Entry<ApexRaftTypeConfig> = bincode::deserialize(&data).map_err(|_| {
-                    let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize log entry");
-                    StorageError::IO {
-                        source: StorageIOError::new(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, &err),
-                    }
-                })?;
-                entries.push(entry);
-            } else {
-                break;
-            }
+        if start > end {
+            return Ok(vec![]);
         }
+
+        let start_key = format!("log:{:020}", start);
+        let mut end_key_bytes = format!("log:{:020}", end).into_bytes();
+        end_key_bytes.push(0xff);
+        let end_key = Bytes::from(end_key_bytes);
+
+        let mut stream = self.engine.scan(
+            Bytes::copy_from_slice(start_key.as_bytes()),
+            end_key,
+        ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+
+        let mut entries = Vec::new();
+        while let Some(res) = stream.next().await {
+            let (_key, val) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            let entry: Entry<ApexRaftTypeConfig> = bincode::deserialize(&val)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            entries.push(entry);
+        }
+
         Ok(entries)
     }
 }
 
-pub struct ApexSnapshotBuilder {
-    engine: Arc<ApexEngine>,
-}
-
-impl RaftSnapshotBuilder<ApexRaftTypeConfig> for ApexSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<ApexRaftTypeConfig>, StorageError<u64>> {
-        let checkpoint_name = format!("checkpoint_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-        let checkpoint_path = Path::new(&checkpoint_name);
-        self.engine.create_checkpoint(checkpoint_path).map_err(ApexRaftStorage::map_engine_error)?;
-        
-        let last_applied_data = self.engine.get(b"meta:last_applied").map_err(ApexRaftStorage::map_engine_error)?;
-        let last_applied: Option<LogId<u64>> = match last_applied_data {
-            Some(d) => bincode::deserialize(&d).unwrap(),
-            None => None,
-        };
-
-        let last_membership_data = self.engine.get(b"meta:last_membership").map_err(ApexRaftStorage::map_engine_error)?;
-        let last_membership: StoredMembership<u64, BasicNode> = match last_membership_data {
-            Some(d) => bincode::deserialize(&d).unwrap(),
-            None => StoredMembership::default(),
-        };
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-            snapshot_id: format!("snap-{}", last_applied.map_or(0, |id| id.index)),
-        };
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(std::io::Cursor::new(vec![])),
-        })
-    }
-}
-
-impl RaftStorage<ApexRaftTypeConfig> for ApexRaftStorage {
+impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
     type LogReader = Self;
-    type SnapshotBuilder = ApexSnapshotBuilder;
 
-    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        let data = bincode::serialize(vote).map_err(|_| {
-            let err = std::io::Error::other("Serialize vote failed");
-            StorageError::IO {
-                source: StorageIOError::new(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, &err),
-            }
+    async fn get_log_state(
+        &mut self,
+    ) -> Result<openraft::LogState<ApexRaftTypeConfig>, StorageError<u64>> {
+        let last_id_raw = self.engine.get(b"meta:last_log_id").map_err(|e| {
+            Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e)
         })?;
-        self.engine.put(Bytes::from("meta:vote"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        Ok(())
-    }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        let data = self.engine.get(b"meta:vote").map_err(Self::map_engine_error)?;
-        match data {
-            Some(d) => Ok(Some(bincode::deserialize(&d).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Deserialize vote failed");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Read, &err),
-                }
-            })?)),
-            None => Ok(None),
-        }
-    }
+        let last_log_id = last_id_raw
+            .map(|d| bincode::deserialize::<LogId<u64>>(&d))
+            .transpose()
+            .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
 
-    async fn get_log_state(&mut self) -> Result<LogState<ApexRaftTypeConfig>, StorageError<u64>> {
-        let last_log_id_data = self.engine.get(b"meta:last_log_id").map_err(Self::map_engine_error)?;
-        let last_log_id = match last_log_id_data {
-            Some(data) => bincode::deserialize(&data).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize last_log_id");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, &err),
-                }
-            })?,
-            None => None,
-        };
+        let last_purged_raw = self.engine.get(b"meta:last_purged_log_id").map_err(|e| {
+            Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e)
+        })?;
 
-        let last_purged_data = self.engine.get(b"meta:last_purged_log_id").map_err(Self::map_engine_error)?;
-        let last_purged_log_id = match last_purged_data {
-            Some(data) => bincode::deserialize(&data).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize last_purged_log_id");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, &err),
-                }
-            })?,
-            None => None,
-        };
+        let last_purged_log_id = last_purged_raw
+            .map(|d| bincode::deserialize::<LogId<u64>>(&d))
+            .transpose()
+            .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
 
-        Ok(LogState {
+        Ok(openraft::LogState {
             last_purged_log_id,
             last_log_id,
         })
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
-    }
-
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
-    where
-        I: IntoIterator<Item = openraft::Entry<ApexRaftTypeConfig>> + OptionalSend,
-    {
-        // Collect to avoid non-Send IntoIter issues
-        let entries_vec: Vec<_> = entries.into_iter().collect();
-        let mut last_log_id = None;
-        for entry in entries_vec {
-            last_log_id = Some(entry.log_id);
-            let index = entry.log_id.index;
-            let key = Self::log_key(index);
-            let data = bincode::serialize(&entry).map_err(|_| {
-                let err = std::io::Error::other("Serialize entry failed");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, &err),
-                }
-            })?;
-            self.engine.put(Bytes::from(key), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        }
-
-        if let Some(log_id) = last_log_id {
-            let data = bincode::serialize(&log_id).unwrap();
-            self.engine.put(Bytes::from("meta:last_log_id"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        }
+    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        let data = bincode::serialize(vote)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Write, e))?;
+        self.engine.put_sync(Bytes::from_static(b"meta:vote"), Bytes::from(data)).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Write, e)
+        })?;
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut index = log_id.index;
-        loop {
-            let key = Self::log_key(index);
-            if self.engine.get(&key).map_err(Self::map_engine_error)?.is_none() {
-                break;
-            }
-            self.engine.delete(Bytes::from(key)).await.map_err(Self::map_engine_error)?;
-            index += 1;
+    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+        let data = self.engine.get(b"meta:vote").map_err(|e| {
+            Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Read, e)
+        })?;
+        Ok(data.map(|d| bincode::deserialize(&d).map_err(|e| {
+            Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Read, e)
+        })).transpose()?)
+    }
+
+    async fn append<I>(&mut self, entries: I, callback: LogFlushed<ApexRaftTypeConfig>) -> Result<(), StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<ApexRaftTypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let mut batch = WriteBatch::new();
+        let mut last_log_id = None;
+
+        let entries_vec: Vec<_> = entries.into_iter().collect();
+        for entry in &entries_vec {
+            last_log_id = Some(entry.log_id);
+            let key = format!("log:{:020}", entry.log_id.index);
+            let val = bincode::serialize(&entry)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+            batch.put(Bytes::copy_from_slice(key.as_bytes()), Bytes::from(val));
         }
 
-        let new_last_log_id = if log_id.index > 0 {
-            let prev_key = Self::log_key(log_id.index - 1);
-            let prev_data = self.engine.get(&prev_key).map_err(Self::map_engine_error)?;
-            if let Some(data) = prev_data {
-                let entry: openraft::Entry<ApexRaftTypeConfig> = bincode::deserialize(&data).unwrap();
-                Some(entry.log_id)
-            } else {
-                None
-            }
+        if let Some(log_id) = last_log_id {
+            let meta_val = bincode::serialize(&log_id)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+            batch.put(
+                Bytes::from_static(b"meta:last_log_id"),
+                Bytes::from(meta_val),
+            );
+        }
+
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
+        })?;
+
+        callback.log_io_completed(Ok(()));
+
+        Ok(())
+    }
+
+    async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        let start_key = format!("log:{:020}", log_id.index);
+        let end_key = format!("log:{:020}", u64::MAX);
+
+        let mut batch = WriteBatch::new();
+
+        // 1. Determine the new last_log_id (the entry just before the truncated range)
+        let new_last_id = if log_id.index > 0 {
+            self.try_get_log_entries(log_id.index - 1..log_id.index)
+                .await?
+                .first()
+                .map(|e| e.log_id)
         } else {
             None
         };
 
-        let data = bincode::serialize(&new_last_log_id).unwrap();
-        self.engine.put(Bytes::from("meta:last_log_id"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        
-        Ok(())
-    }
-
-    async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let data = bincode::serialize(&log_id).unwrap();
-        self.engine.put(Bytes::from("meta:last_purged_log_id"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        
-        for index in 0..=log_id.index {
-            let key = Self::log_key(index);
-            self.engine.delete(Bytes::from(key)).await.map_err(Self::map_engine_error)?;
+        // 2. Update metadata in the same batch
+        if let Some(id) = new_last_id {
+            let val = bincode::serialize(&id)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+            batch.put(Bytes::from_static(b"meta:last_log_id"), Bytes::from(val));
+        } else {
+            batch.delete(Bytes::from_static(b"meta:last_log_id"));
         }
+
+        // 3. Scan and add deletions to the batch
+        let mut stream = self.engine.scan(
+            Bytes::copy_from_slice(start_key.as_bytes()),
+            Bytes::copy_from_slice(end_key.as_bytes()),
+        ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+
+        while let Some(res) = stream.next().await {
+            let (key, _) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            batch.delete(key);
+        }
+
+        // 4. Commit atomically
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
+        })?;
+
         Ok(())
     }
 
-    async fn last_applied_state(
+    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        let start_key = format!("log:{:020}", 0);
+        let end_key = format!("log:{:020}", log_id.index);
+
+        let mut stream = self.engine.scan(
+            Bytes::copy_from_slice(start_key.as_bytes()),
+            Bytes::copy_from_slice(end_key.as_bytes()),
+        ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+
+        let mut batch = WriteBatch::new();
+        while let Some(res) = stream.next().await {
+            let (key, _val) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            batch.delete(key);
+        }
+
+        let val = bincode::serialize(&log_id)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        batch.put(
+            Bytes::from_static(b"meta:last_purged_log_id"),
+            Bytes::from(val),
+        );
+
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+}
+
+impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let last_applied_data = self.engine.get(b"meta:last_applied").map_err(Self::map_engine_error)?;
-        let last_applied = match last_applied_data {
-            Some(d) => bincode::deserialize(&d).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Deserialize last_applied failed");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::StateMachine, openraft::ErrorVerb::Read, &err),
-                }
-            })?,
-            None => None,
-        };
+        let last_applied_raw = self.engine.get(b"meta:last_applied").map_err(|e| {
+            Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Read, e)
+        })?;
 
-        let last_membership_data = self.engine.get(b"meta:last_membership").map_err(Self::map_engine_error)?;
-        let last_membership = match last_membership_data {
-            Some(d) => bincode::deserialize(&d).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Deserialize last_membership failed");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::StateMachine, openraft::ErrorVerb::Read, &err),
-                }
-            })?,
-            None => StoredMembership::default(),
-        };
+        let last_applied = last_applied_raw
+            .map(|d| bincode::deserialize::<LogId<u64>>(&d))
+            .transpose()
+            .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
 
-        Ok((last_applied, last_membership))
+        let membership_raw = self.engine.get(b"meta:membership").map_err(|e| {
+            Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Read, e)
+        })?;
+
+        let membership = membership_raw
+            .map(|d| bincode::deserialize::<StoredMembership<u64, BasicNode>>(&d))
+            .transpose()
+            .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?
+            .unwrap_or_default();
+
+        Ok((last_applied, membership))
     }
 
-    async fn apply_to_state_machine(
-        &mut self,
-        entries: &[openraft::Entry<ApexRaftTypeConfig>],
-    ) -> Result<Vec<Vec<u8>>, StorageError<u64>> {
-        let mut responses = Vec::new();
-        for entry in entries {
-            let last_log_id = entry.log_id;
-            
-            if let openraft::EntryPayload::Normal(data) = &entry.payload {
-                if let Ok((key, value)) = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(data) {
-                    let mut full_key = b"data:".to_vec();
-                    full_key.extend_from_slice(&key);
-                    self.engine.put(Bytes::from(full_key), Bytes::from(value.clone())).await.map_err(Self::map_engine_error)?;
-                    responses.push(vec![1]);
-                } else {
-                    responses.push(vec![0]);
-                }
-            } else if let openraft::EntryPayload::Membership(m) = &entry.payload {
-                let membership = StoredMembership::new(Some(last_log_id), m.clone());
-                let data = bincode::serialize(&membership).unwrap();
-                self.engine.put(Bytes::from("meta:last_membership"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-                responses.push(vec![]);
-            }
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Vec<u8>>, StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<ApexRaftTypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let mut res = Vec::new();
+        let mut batch = WriteBatch::new();
+        let mut last_applied = None;
 
-            let data = bincode::serialize(&Some(last_log_id)).unwrap();
-            self.engine.put(Bytes::from("meta:last_applied"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
+        for entry in entries {
+            last_applied = Some(entry.log_id);
+            match &entry.payload {
+                EntryPayload::Normal(data) => {
+                    let command: RaftCommand = bincode::deserialize(data)
+                        .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+
+                    match command {
+                        RaftCommand::Put(key, value) => {
+                            let mut data_key = Vec::with_capacity(5 + key.len());
+                            data_key.extend_from_slice(b"data:");
+                            data_key.extend_from_slice(&key);
+                            batch.put(Bytes::from(data_key), Bytes::from(value));
+                        }
+                        RaftCommand::Delete(key) => {
+                            let mut data_key = Vec::with_capacity(5 + key.len());
+                            data_key.extend_from_slice(b"data:");
+                            data_key.extend_from_slice(&key);
+                            batch.delete(Bytes::from(data_key));
+                        }
+                    }
+                    res.push(data.clone());
+                }
+                EntryPayload::Blank => res.push(vec![]),
+                EntryPayload::Membership(m) => {
+                    let membership = StoredMembership::new(Some(entry.log_id), m.clone());
+                    let val = bincode::serialize(&membership)
+                        .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                    batch.put(Bytes::from_static(b"meta:membership"), Bytes::from(val));
+                    res.push(vec![]);
+                }
+            }
         }
-        Ok(responses)
+
+        if let Some(log_id) = last_applied {
+            let val = bincode::serialize(&log_id)
+                .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            batch.put(
+                Bytes::from_static(b"meta:last_applied"),
+                Bytes::from(val),
+            );
+        }
+
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e)
+        })?;
+
+        Ok(res)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        ApexSnapshotBuilder { engine: self.engine.clone() }
+        self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(std::io::Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+        Ok(Box::new(Cursor::new(Vec::new())))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, BasicNode>,
-        _snapshot: Box<std::io::Cursor<Vec<u8>>>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        let data = bincode::serialize(&meta.last_log_id).unwrap();
-        self.engine.put(Bytes::from("meta:last_applied"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
+        let signature = Self::get_signature(meta);
+
+        // Use a buffered reader for efficient streaming deserialization
+        let mut reader = std::io::BufReader::new(snapshot);
         
-        let data = bincode::serialize(&meta.last_membership).unwrap();
-        self.engine.put(Bytes::from("meta:last_membership"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        
-        let data = bincode::serialize(meta).unwrap();
-        self.engine.put(Bytes::from("meta:snapshot_meta"), Bytes::from(data)).await.map_err(Self::map_engine_error)?;
-        
+        // 1. Read the number of entries
+        let count: u64 = bincode::deserialize_from(&mut reader)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
+
+        let mut batch = WriteBatch::new();
+
+        // 1. Wipe existing state machine data
+        let mut stream = self.engine.scan(
+            Bytes::from_static(b"data:"),
+            Bytes::from_static(b"data\xff"),
+        ).map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+
+        while let Some(res) = stream.next().await {
+            let (key, _) = res.map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+            batch.delete(key);
+        }
+
+        // 2. Wipe existing metadata to prevent mixed state
+        batch.delete(Bytes::from_static(b"meta:last_applied"));
+        batch.delete(Bytes::from_static(b"meta:membership"));
+        batch.delete(Bytes::from_static(b"meta:last_log_id"));
+
+        // 3. Re-apply state machine data from snapshot
+        for _ in 0..count {
+            let (k, v): (Vec<u8>, Vec<u8>) = bincode::deserialize_from(&mut reader)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
+            batch.put(Bytes::from(k), Bytes::from(v));
+        }
+
+        let meta_val = bincode::serialize(meta)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
+        batch.put(Bytes::from_static(b"meta:snapshot"), Bytes::from(meta_val));
+
+        if let Some(last_id) = meta.last_log_id {
+            let last_id_val = bincode::serialize(&last_id)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
+            batch.put(Bytes::from_static(b"meta:last_applied"), Bytes::from(last_id_val));
+        }
+
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e)
+        })?;
+
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ApexRaftTypeConfig>>, StorageError<u64>> {
-        let meta_data = self.engine.get(b"meta:snapshot_meta").map_err(Self::map_engine_error)?;
-        let meta = match meta_data {
-            Some(d) => bincode::deserialize(&d).map_err(|_| {
-                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "Deserialize snapshot_meta failed");
-                StorageError::IO {
-                    source: StorageIOError::new(openraft::ErrorSubject::Snapshot(None), openraft::ErrorVerb::Read, &err),
-                }
-            })?,
+        let meta_raw = self.engine.get(b"meta:snapshot").map_err(|e| {
+            Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e)
+        })?;
+
+        let meta = match meta_raw {
+            Some(d) => bincode::deserialize::<SnapshotMeta<u64, BasicNode>>(&d)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?,
             None => return Ok(None),
         };
 
+        let signature = Self::get_signature(&meta);
+
+        let mut stream = self.engine.scan(
+            Bytes::from_static(b"data:"),
+            Bytes::from_static(b"data\xff"),
+        ).map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+
+        let mut data = Vec::new();
+        
+        // First, count entries to write a header (or we could use a different streaming format)
+        // For simplicity with bincode's deserialize_from, we'll do two passes or just buffer keys.
+        // Actually, let's just buffer the keys and values in a streaming-compatible way.
+        let mut count: u64 = 0;
+        let mut entries = Vec::new();
+        while let Some(res) = stream.next().await {
+            let (k, v) = res.map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+            entries.push((k, v));
+            count += 1;
+        }
+
+        bincode::serialize_into(&mut data, &count)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+
+        for (k, v) in entries {
+            bincode::serialize_into(&mut data, &(k.to_vec(), v.to_vec()))
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+        }
+
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(std::io::Cursor::new(vec![])),
+            snapshot: Box::new(Cursor::new(data)),
         }))
+    }
+}
+
+impl RaftSnapshotBuilder<ApexRaftTypeConfig> for ApexRaftStorage {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<ApexRaftTypeConfig>, StorageError<u64>> {
+        let (last_applied, membership) = self.applied_state().await?;
+
+        let snapshot_id = format!(
+            "snapshot-{}",
+            last_applied.map_or(0, |id| id.index)
+        );
+
+        let meta = SnapshotMeta {
+            last_log_id: last_applied,
+            last_membership: membership,
+            snapshot_id,
+        };
+
+        let meta_val = bincode::serialize(&meta)
+            .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        
+        self.engine.put_sync(Bytes::from_static(b"meta:snapshot"), Bytes::from(meta_val)).await.map_err(|e| {
+            Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
+        })?;
+
+        let signature = Self::get_signature(&meta);
+
+        self.get_current_snapshot()
+            .await?
+            .ok_or_else(|| StorageError::IO {
+                source: StorageIOError::new(
+                    ErrorSubject::Snapshot(Some(signature)),
+                    ErrorVerb::Read,
+                    AnyError::new(&std::io::Error::new(std::io::ErrorKind::NotFound, "Snapshot just created but not found")),
+                )
+            })
     }
 }

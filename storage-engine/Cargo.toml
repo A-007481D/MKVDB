@@ -18,7 +18,7 @@ tokio-util = { version = "0.7.18", features = ["codec"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 lz4_flex = "0.13.0"
-openraft = { version = "0.9.15", features = ["serde"] }
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
 tonic = { version = "0.12.3", features = ["tls", "tls-roots", "gzip"] }
 prost = "0.13.3"
 serde = { version = "1.0", features = ["derive"] }
