@@ -68,11 +68,13 @@ impl RaftLogReader<ApexRaftTypeConfig> for ApexRaftStorage {
         }
 
         let start_key = format!("log:{:020}", start);
-        let end_key = format!("log:{:020}", end);
+        let mut end_key_bytes = format!("log:{:020}", end).into_bytes();
+        end_key_bytes.push(0xff);
+        let end_key = Bytes::from(end_key_bytes);
 
         let mut stream = self.engine.scan(
             Bytes::copy_from_slice(start_key.as_bytes()),
-            Bytes::copy_from_slice(end_key.as_bytes()),
+            end_key,
         ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
 
         let mut entries = Vec::new();
@@ -174,28 +176,42 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
         let start_key = format!("log:{:020}", log_id.index);
         let end_key = format!("log:{:020}", u64::MAX);
 
+        let mut batch = WriteBatch::new();
+
+        // 1. Determine the new last_log_id (the entry just before the truncated range)
+        let new_last_id = if log_id.index > 0 {
+            self.try_get_log_entries(log_id.index - 1..log_id.index)
+                .await?
+                .first()
+                .map(|e| e.log_id)
+        } else {
+            None
+        };
+
+        // 2. Update metadata in the same batch
+        if let Some(id) = new_last_id {
+            let val = bincode::serialize(&id)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+            batch.put(Bytes::from_static(b"meta:last_log_id"), Bytes::from(val));
+        } else {
+            batch.delete(Bytes::from_static(b"meta:last_log_id"));
+        }
+
+        // 3. Scan and add deletions to the batch
         let mut stream = self.engine.scan(
             Bytes::copy_from_slice(start_key.as_bytes()),
             Bytes::copy_from_slice(end_key.as_bytes()),
         ).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
 
-        let mut batch = WriteBatch::new();
         while let Some(res) = stream.next().await {
-            let (key, _val) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+            let (key, _) = res.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
             batch.delete(key);
         }
 
+        // 4. Commit atomically
         self.engine.write_batch(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
         })?;
-
-        let last_log_id = self.try_get_log_entries(..log_id.index).await?.last().map(|e| e.log_id);
-        if let Some(id) = last_log_id {
-            let val = bincode::serialize(&id).map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
-            self.engine.put(Bytes::from_static(b"meta:last_log_id"), Bytes::from(val)).await.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
-        } else {
-            self.engine.delete(Bytes::from_static(b"meta:last_log_id")).await.map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
-        }
 
         Ok(())
     }
@@ -275,9 +291,16 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(data) => {
+                    let (key, value): (Vec<u8>, Vec<u8>) = bincode::deserialize(data)
+                        .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                    
+                    let mut data_key = Vec::with_capacity(5 + key.len());
+                    data_key.extend_from_slice(b"data:");
+                    data_key.extend_from_slice(&key);
+                    
                     batch.put(
-                        Bytes::from(format!("data:{:020}", entry.log_id.index)),
-                        Bytes::from(data.clone()),
+                        Bytes::from(data_key),
+                        Bytes::from(value),
                     );
                     res.push(data.clone());
                 }
@@ -323,12 +346,16 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
     ) -> Result<(), StorageError<u64>> {
         let signature = Self::get_signature(meta);
 
-        let data = snapshot.into_inner();
-        let state_machine_data: Vec<(Vec<u8>, Vec<u8>)> = bincode::deserialize(&data)
+        // Use a buffered reader for efficient streaming deserialization
+        let mut reader = std::io::BufReader::new(snapshot);
+        
+        // 1. Read the number of entries
+        let count: u64 = bincode::deserialize_from(&mut reader)
             .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
 
         let mut batch = WriteBatch::new();
 
+        // 1. Wipe existing state machine data
         let mut stream = self.engine.scan(
             Bytes::from_static(b"data:"),
             Bytes::from_static(b"data\xff"),
@@ -339,7 +366,15 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             batch.delete(key);
         }
 
-        for (k, v) in state_machine_data {
+        // 2. Wipe existing metadata to prevent mixed state
+        batch.delete(Bytes::from_static(b"meta:last_applied"));
+        batch.delete(Bytes::from_static(b"meta:membership"));
+        batch.delete(Bytes::from_static(b"meta:last_log_id"));
+
+        // 3. Re-apply state machine data from snapshot
+        for _ in 0..count {
+            let (k, v): (Vec<u8>, Vec<u8>) = bincode::deserialize_from(&mut reader)
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e))?;
             batch.put(Bytes::from(k), Bytes::from(v));
         }
 
@@ -380,14 +415,26 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             Bytes::from_static(b"data\xff"),
         ).map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
 
-        let mut state_data = Vec::new();
+        let mut data = Vec::new();
+        
+        // First, count entries to write a header (or we could use a different streaming format)
+        // For simplicity with bincode's deserialize_from, we'll do two passes or just buffer keys.
+        // Actually, let's just buffer the keys and values in a streaming-compatible way.
+        let mut count: u64 = 0;
+        let mut entries = Vec::new();
         while let Some(res) = stream.next().await {
             let (k, v) = res.map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
-            state_data.push((k.to_vec(), v.to_vec()));
+            entries.push((k, v));
+            count += 1;
         }
 
-        let data = bincode::serialize(&state_data)
+        bincode::serialize_into(&mut data, &count)
             .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+
+        for (k, v) in entries {
+            bincode::serialize_into(&mut data, &(k.to_vec(), v.to_vec()))
+                .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Read, e))?;
+        }
 
         Ok(Some(Snapshot {
             meta,
