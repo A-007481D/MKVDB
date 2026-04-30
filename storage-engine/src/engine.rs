@@ -566,6 +566,125 @@ impl ApexEngine {
         Ok(())
     }
 
+    /// Applies a batch of operations with **mandatory fsync**.
+    ///
+    /// This bypasses `SyncPolicy` and always fsyncs the WAL before returning.
+    /// Used by Raft storage paths where durability before return is a
+    /// correctness requirement (vote persistence, log append, state machine
+    /// apply), not a tunable policy.
+    pub async fn write_batch_sync(&self, batch: WriteBatch) -> Result<()> {
+        let _permit = self.concurrency_semaphore.try_acquire().map_err(|_| {
+            ApexError::EngineOverloaded("Max concurrent operations reached".to_string())
+        })?;
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // ---- Stalling Backpressure Loop ----
+        let mut backoff_ms = 10;
+        let start_stall = Instant::now();
+
+        loop {
+            let imm_count = self.immutable_memtables.len();
+            let version = self.version_set.load();
+            let l0_count = version.l0_count();
+
+            if l0_count < self.config.l0_compaction_threshold
+                && imm_count < self.config.immutable_memtable_threshold
+            {
+                break;
+            }
+
+            self.metrics.record_stall();
+
+            if start_stall.elapsed() >= Duration::from_secs(5) {
+                let final_version = self.version_set.load();
+                let final_l0 = final_version.l0_count();
+                let final_imm = self.immutable_memtables.len();
+                if final_l0 < self.config.l0_compaction_threshold
+                    && final_imm < self.config.immutable_memtable_threshold
+                {
+                    break;
+                }
+
+                return Err(ApexError::EngineOverloaded(format!(
+                    "Engine saturated (L0: {}, Imm: {}) after {:?}",
+                    final_l0,
+                    final_imm,
+                    start_stall.elapsed()
+                )));
+            }
+
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = std::cmp::min(500, backoff_ms * 2);
+        }
+
+        // --- Phase 1: WAL append + forced fsync (under Mutex) ---
+        let start_lsn;
+        let bytes_written;
+        {
+            let mut wal = self.wal.lock();
+            start_lsn = self
+                .next_lsn
+                .fetch_add(batch.len() as u64, Ordering::SeqCst);
+
+            let mut total_bytes = 0;
+            for (i, op) in batch.ops.iter().enumerate() {
+                let lsn = start_lsn + i as u64;
+                match op {
+                    BatchOp::Put(k, v) => {
+                        total_bytes += wal.append(lsn, k, &EntryValue::Value(v.clone()))?;
+                    }
+                    BatchOp::Delete(k) => {
+                        total_bytes += wal.append(lsn, k, &EntryValue::Tombstone)?;
+                    }
+                }
+            }
+            bytes_written = total_bytes;
+
+            // Always fsync — this is the Raft durability contract.
+            wal.sync()?;
+            self.metrics.record_wal_sync();
+        }
+
+        self.metrics.record_wal_write(bytes_written);
+
+        // --- Phase 2: MemTable insertion ---
+        let version = self.version_set.load();
+        for (i, op) in batch.ops.iter().enumerate() {
+            let lsn = start_lsn + i as u64;
+            match op {
+                BatchOp::Put(k, v) => {
+                    version
+                        .active_memtable
+                        .put(k.clone(), EntryValue::Value(v.clone()), lsn);
+                }
+                BatchOp::Delete(k) => {
+                    version
+                        .active_memtable
+                        .put(k.clone(), EntryValue::Tombstone, lsn);
+                }
+            }
+        }
+
+        // --- Phase 3: Flush trigger ---
+        if version.active_memtable.size() > MEMTABLE_SIZE_LIMIT {
+            self.trigger_flush()?;
+        }
+
+        Ok(())
+    }
+
+    /// Single-key put with **mandatory fsync**.
+    ///
+    /// Convenience wrapper for Raft-critical metadata writes (vote, etc.).
+    pub async fn put_sync(&self, key: Bytes, value: Bytes) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write_batch_sync(batch).await
+    }
+
     // -----------------------------------------------------------------------
     // Flush (memtable → SSTable)
     // -----------------------------------------------------------------------

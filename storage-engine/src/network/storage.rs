@@ -3,6 +3,7 @@ use std::ops::RangeBounds;
 use bytes::Bytes;
 use crate::batch::WriteBatch;
 use crate::engine::ApexEngine;
+use crate::network::node::RaftCommand;
 use futures_util::StreamExt;
 use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
@@ -122,7 +123,7 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let data = bincode::serialize(vote)
             .map_err(|e| Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Write, e))?;
-        self.engine.put(Bytes::from_static(b"meta:vote"), Bytes::from(data)).await.map_err(|e| {
+        self.engine.put_sync(Bytes::from_static(b"meta:vote"), Bytes::from(data)).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Write, e)
         })?;
         Ok(())
@@ -163,7 +164,7 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             );
         }
 
-        self.engine.write_batch(batch).await.map_err(|e| {
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
         })?;
 
@@ -209,7 +210,7 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
         }
 
         // 4. Commit atomically
-        self.engine.write_batch(batch).await.map_err(|e| {
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
         })?;
 
@@ -238,7 +239,7 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             Bytes::from(val),
         );
 
-        self.engine.write_batch(batch).await.map_err(|e| {
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e)
         })?;
 
@@ -291,17 +292,23 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(data) => {
-                    let (key, value): (Vec<u8>, Vec<u8>) = bincode::deserialize(data)
+                    let command: RaftCommand = bincode::deserialize(data)
                         .map_err(|e| Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-                    
-                    let mut data_key = Vec::with_capacity(5 + key.len());
-                    data_key.extend_from_slice(b"data:");
-                    data_key.extend_from_slice(&key);
-                    
-                    batch.put(
-                        Bytes::from(data_key),
-                        Bytes::from(value),
-                    );
+
+                    match command {
+                        RaftCommand::Put(key, value) => {
+                            let mut data_key = Vec::with_capacity(5 + key.len());
+                            data_key.extend_from_slice(b"data:");
+                            data_key.extend_from_slice(&key);
+                            batch.put(Bytes::from(data_key), Bytes::from(value));
+                        }
+                        RaftCommand::Delete(key) => {
+                            let mut data_key = Vec::with_capacity(5 + key.len());
+                            data_key.extend_from_slice(b"data:");
+                            data_key.extend_from_slice(&key);
+                            batch.delete(Bytes::from(data_key));
+                        }
+                    }
                     res.push(data.clone());
                 }
                 EntryPayload::Blank => res.push(vec![]),
@@ -324,7 +331,7 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             );
         }
 
-        self.engine.write_batch(batch).await.map_err(|e| {
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e)
         })?;
 
@@ -388,7 +395,7 @@ impl RaftStateMachine<ApexRaftTypeConfig> for ApexRaftStorage {
             batch.put(Bytes::from_static(b"meta:last_applied"), Bytes::from(last_id_val));
         }
 
-        self.engine.write_batch(batch).await.map_err(|e| {
+        self.engine.write_batch_sync(batch).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Snapshot(Some(signature.clone())), ErrorVerb::Write, e)
         })?;
 
@@ -463,7 +470,7 @@ impl RaftSnapshotBuilder<ApexRaftTypeConfig> for ApexRaftStorage {
         let meta_val = bincode::serialize(&meta)
             .map_err(|e| Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
         
-        self.engine.put(Bytes::from_static(b"meta:snapshot"), Bytes::from(meta_val)).await.map_err(|e| {
+        self.engine.put_sync(Bytes::from_static(b"meta:snapshot"), Bytes::from(meta_val)).await.map_err(|e| {
             Self::map_io_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
         })?;
 
