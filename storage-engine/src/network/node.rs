@@ -48,20 +48,31 @@ pub struct ApexNode {
     pub node_id: u64,
     pub raft: Raft<ApexRaftTypeConfig>,
     pub engine: Arc<ApexEngine>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ApexNode {
-    /// Starts the node, initializing the storage engine, Raft consensus, and gRPC network.
-    /// 
-    /// # Arguments
-    /// * `node_id` - Unique identifier for this node in the cluster.
-    /// * `bind_addr` - The address to bind the gRPC server to (e.g., "0.0.0.0:50051").
-    /// * `engine` - The shared ApexEngine instance.
-    pub async fn start(node_id: u64, bind_addr: &str, engine: Arc<ApexEngine>) -> Result<Self> {
-        // 1. Initialize ApexRaftNetworkFactory (the networking adapter)
-        let network_factory = ApexRaftNetworkFactory {};
+    /// Starts the node with the default gRPC networking factory.
+    pub async fn start(
+        node_id: u64, 
+        bind_addr: &str, 
+        engine: Arc<ApexEngine>,
+    ) -> Result<Self> {
+        Self::start_with_network(node_id, bind_addr, engine, ApexRaftNetworkFactory {}).await
+    }
 
-        // 2. Initialize ApexRaftStorage (the storage adapter)
+    /// Starts the node with a custom networking factory.
+    pub async fn start_with_network<N>(
+        node_id: u64, 
+        bind_addr: &str, 
+        engine: Arc<ApexEngine>,
+        network_factory: N,
+    ) -> Result<Self> 
+    where 
+        N: openraft::network::RaftNetworkFactory<ApexRaftTypeConfig> + Send + Sync + 'static,
+        N::Network: openraft::network::RaftNetwork<ApexRaftTypeConfig> + Send + Sync + 'static,
+    {
+        // 1. Storage adapter initialization
         let storage = ApexRaftStorage::new(engine.clone());
 
         // 3. Configure and initialize the openraft::Raft instance
@@ -89,13 +100,15 @@ impl ApexNode {
         let server = ApexRaftServer::new(raft_clone);
         let grpc_service = server.into_grpc_service();
 
-        // 5. Spawn the gRPC server in a background task
+        // 5. Spawn the gRPC server with a graceful shutdown signal
         let addr = bind_addr.parse()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         tokio::spawn(async move {
             tracing::info!("Starting Raft gRPC server on {}", addr);
             if let Err(e) = Server::builder()
                 .add_service(grpc_service)
-                .serve(addr)
+                .serve_with_shutdown(addr, async { shutdown_rx.await.ok(); })
                 .await {
                 tracing::error!("Raft gRPC server error: {}", e);
             }
@@ -119,7 +132,15 @@ impl ApexNode {
             node_id,
             raft,
             engine,
+            shutdown_tx: Some(shutdown_tx),
         })
+    }
+
+    /// Gracefully stop the gRPC server, releasing the bound socket.
+    pub fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
     }
 
     fn map_forwarded_leader(leader: &ForwardToLeader<u64, BasicNode>) -> WriteRedirect {
