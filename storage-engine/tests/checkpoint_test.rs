@@ -31,12 +31,11 @@ mod tests {
             .await
             .unwrap();
 
-        // 2. Create checkpoint (Async)
+        // 2. Create checkpoint (Sync)
         let cp_dir = tempdir().unwrap();
         let cp_path = cp_dir.path().join("cp1");
         engine
             .create_checkpoint(&cp_path)
-            .await
             .expect("Failed to create checkpoint");
 
         // 3. Write data AFTER checkpoint start
