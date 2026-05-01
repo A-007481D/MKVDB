@@ -202,7 +202,11 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             if actual_id != Some(expected_id) {
                 let msg = format!("RaftStorage persistence mismatch! Expected last_log_id {:?}, found {:?}", expected_id, actual_id);
                 tracing::error!("{}", msg);
-                return Err(StorageError::write_logs(anyhow::anyhow!(msg)));
+                return Err(Self::map_io_err(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, msg)
+                ));
             }
         }
 
