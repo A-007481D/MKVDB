@@ -1,5 +1,5 @@
 use openraft::{
-    BasicNode, CommittedLeaderId, LogId, RaftTypeConfig, StoredMembership,
+    BasicNode, CommittedLeaderId, RaftTypeConfig, StoredMembership,
     error::{InstallSnapshotError, NetworkError, RPCError, RaftError},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
@@ -156,8 +156,9 @@ impl RaftService for ApexRaftServer {
         let (success, conflict_log_id) = match resp {
             AppendEntriesResponse::Success => (true, None),
             AppendEntriesResponse::PartialSuccess(id) => (true, id),
-            AppendEntriesResponse::Conflict => (false, None),
-            AppendEntriesResponse::HigherVote(_) => (false, None),
+            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_) => {
+                (false, None)
+            }
         };
 
         let current_metrics = self.raft.metrics().borrow().clone();
@@ -201,7 +202,6 @@ impl RaftService for ApexRaftServer {
         let req = request.into_inner();
         let vote = req
             .vote
-            .clone()
             .map(Into::into)
             .ok_or_else(|| Status::invalid_argument("missing vote"))?;
         let last_log_id = req
@@ -345,8 +345,7 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         Ok(InstallSnapshotResponse {
             vote: resp
                 .vote
-                .map(Into::into)
-                .unwrap_or_else(|| openraft::Vote::new(0, self.target)),
+                .map_or_else(|| openraft::Vote::new(0, self.target), Into::into),
         })
     }
 
@@ -371,8 +370,7 @@ impl RaftNetwork<ApexRaftTypeConfig> for ApexRaftNetworkConnection {
         Ok(VoteResponse {
             vote: resp
                 .vote
-                .map(Into::into)
-                .unwrap_or_else(|| openraft::Vote::new(0, self.target)),
+                .map_or_else(|| openraft::Vote::new(0, self.target), Into::into),
             vote_granted: resp.vote_granted,
             last_log_id: rpc.last_log_id,
         })

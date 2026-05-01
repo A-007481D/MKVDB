@@ -125,8 +125,7 @@ impl ApexNode {
 
         if retry == 20 {
             return Err(anyhow::anyhow!(
-                "Raft server failed to bind on {} after 1s",
-                addr
+                "Raft server failed to bind on {addr} after 1s"
             ));
         }
 
@@ -188,8 +187,7 @@ impl ApexNode {
         // 2. Perform a linearizability check to force a quorum confirmation.
         self.raft.ensure_linearizable().await.map_err(|e| {
             anyhow::anyhow!(
-                "Cluster stabilization failed: leader cannot confirm quorum: {:?}",
-                e
+                "Cluster stabilization failed: leader cannot confirm quorum: {e:?}"
             )
         })?;
 
@@ -227,7 +225,7 @@ impl ApexNode {
         // Final sanity write to ensure the term is "sealed"
         self.commit_noop_barrier()
             .await
-            .map_err(|e| anyhow::anyhow!("Barrier failed: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Barrier failed: {e:?}"))?;
 
         Ok(self.raft.add_learner(node_id, node, blocking).await?)
     }

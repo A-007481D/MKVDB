@@ -68,8 +68,8 @@ impl RaftLogReader<ApexRaftTypeConfig> for ApexRaftStorage {
             return Ok(vec![]);
         }
 
-        let start_key = format!("log:{:020}", start);
-        let mut end_key_bytes = format!("log:{:020}", end).into_bytes();
+        let start_key = format!("log:{start:020}");
+        let mut end_key_bytes = format!("log:{end:020}").into_bytes();
         end_key_bytes.push(0xff);
         let end_key = Bytes::from(end_key_bytes);
 
@@ -163,12 +163,12 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
             .engine
             .get(b"meta:vote")
             .map_err(|e| Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Read, e))?;
-        Ok(data
-            .map(|d| {
-                bincode::deserialize(&d)
-                    .map_err(|e| Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Read, e))
-            })
-            .transpose()?)
+        data.map(|d| {
+            bincode::deserialize(&d)
+                .map_err(|e| Box::new(Self::map_io_err(ErrorSubject::Vote, ErrorVerb::Read, e)))
+        })
+        .transpose()
+        .map_err(|e| *e)
     }
 
     async fn append<I>(
@@ -186,7 +186,8 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
         let entries_vec: Vec<_> = entries.into_iter().collect();
         for entry in &entries_vec {
             last_log_id = Some(entry.log_id);
-            let key = format!("log:{:020}", entry.log_id.index);
+            let index = entry.log_id.index;
+            let key = format!("log:{index:020}");
             let val = bincode::serialize(&entry)
                 .map_err(|e| Self::map_io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
             batch.put(Bytes::copy_from_slice(key.as_bytes()), Bytes::from(val));
@@ -220,14 +221,13 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
 
             if actual_id != Some(expected_id) {
                 let msg = format!(
-                    "RaftStorage persistence mismatch! Expected last_log_id {:?}, found {:?}",
-                    expected_id, actual_id
+                    "RaftStorage persistence mismatch! Expected last_log_id {expected_id:?}, found {actual_id:?}"
                 );
                 tracing::error!("{}", msg);
                 return Err(Self::map_io_err(
                     openraft::ErrorSubject::Logs,
                     openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, msg),
+                    std::io::Error::other(msg),
                 ));
             }
         }
@@ -238,7 +238,8 @@ impl RaftLogStorage<ApexRaftTypeConfig> for ApexRaftStorage {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let start_key = format!("log:{:020}", log_id.index);
+        let index = log_id.index;
+        let start_key = format!("log:{index:020}");
         let end_key = format!("log:{:020}", u64::MAX);
 
         let mut batch = WriteBatch::new();
