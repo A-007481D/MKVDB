@@ -124,9 +124,7 @@ impl ApexNode {
         }
 
         if retry == 20 {
-            return Err(anyhow::anyhow!(
-                "Raft server failed to bind on {addr} after 1s"
-            ));
+            return Err(anyhow::anyhow!("Raft server failed to bind on {addr} after 1s"));
         }
 
         Ok(Self {
@@ -186,9 +184,7 @@ impl ApexNode {
 
         // 2. Perform a linearizability check to force a quorum confirmation.
         self.raft.ensure_linearizable().await.map_err(|e| {
-            anyhow::anyhow!(
-                "Cluster stabilization failed: leader cannot confirm quorum: {e:?}"
-            )
+            anyhow::anyhow!("Cluster stabilization failed: leader cannot confirm quorum: {e:?}")
         })?;
 
         // 3. Sledgehammer Quiescence: Give the cluster 2 seconds to synchronize internal state.
