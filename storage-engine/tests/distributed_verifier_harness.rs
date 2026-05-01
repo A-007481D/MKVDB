@@ -57,19 +57,26 @@ async fn bootstrap_cluster(nodes: &[TestNode]) {
             addr: nodes[0].raft_addr.clone(),
         },
     );
-    
+
     println!("Initializing Node 1...");
-    nodes[0].node.raft.initialize(members)
+    nodes[0]
+        .node
+        .raft
+        .initialize(members)
         .await
         .expect("initialize failed");
 
     // 2. Wait for Node 1 to stabilize as Leader
-    nodes[0].node.await_cluster_stable(Duration::from_secs(10))
+    nodes[0]
+        .node
+        .await_cluster_stable(Duration::from_secs(10))
         .await
         .expect("Node 1 failed to stabilize");
 
     // 3. Write "Seal" entry to ensure vote is committed
-    nodes[0].node.write_put(b"bootstrap".to_vec(), b"leader-stable".to_vec())
+    nodes[0]
+        .node
+        .write_put(b"bootstrap".to_vec(), b"leader-stable".to_vec())
         .await
         .expect("Seal write failed");
 
@@ -77,28 +84,35 @@ async fn bootstrap_cluster(nodes: &[TestNode]) {
     for i in 1..nodes.len() {
         let n = &nodes[i];
         println!("Adding Node {} as learner...", n.id);
-        
-        nodes[0].node.safe_add_learner(
-            n.id,
-            BasicNode {
-                addr: n.raft_addr.clone(),
-            },
-            true,
-        )
-        .await
-        .expect("safe_add_learner failed");
-        
+
+        nodes[0]
+            .node
+            .safe_add_learner(
+                n.id,
+                BasicNode {
+                    addr: n.raft_addr.clone(),
+                },
+                true,
+            )
+            .await
+            .expect("safe_add_learner failed");
+
         // Wait for replication to catch up
         let node_id = n.id;
-        nodes[0].node.raft
+        nodes[0]
+            .node
+            .raft
             .wait(Some(Duration::from_secs(10)))
-            .metrics(move |m| {
-                m.replication.as_ref().map_or(false, |r| {
-                    r.get(&node_id).and_then(|matched| {
-                        matched.as_ref().map(|id| id.index >= 1)
-                    }).unwrap_or(false)
-                })
-            }, "learner catchup")
+            .metrics(
+                move |m| {
+                    m.replication.as_ref().map_or(false, |r| {
+                        r.get(&node_id)
+                            .and_then(|matched| matched.as_ref().map(|id| id.index >= 1))
+                            .unwrap_or(false)
+                    })
+                },
+                "learner catchup",
+            )
             .await
             .expect("learner catchup timed out");
     }
@@ -106,12 +120,16 @@ async fn bootstrap_cluster(nodes: &[TestNode]) {
     // 5. Promote to full 3-node cluster
     println!("Promoting cluster to 3 nodes...");
     let membership = BTreeSet::from_iter(nodes.iter().map(|n| n.id));
-    nodes[0].node.safe_change_membership(membership, false)
+    nodes[0]
+        .node
+        .safe_change_membership(membership, false)
         .await
         .expect("safe_change_membership failed");
-    
+
     // 6. Final stabilization
-    nodes[0].node.await_cluster_stable(Duration::from_secs(10))
+    nodes[0]
+        .node
+        .await_cluster_stable(Duration::from_secs(10))
         .await
         .expect("Final stabilization failed");
 }
@@ -138,7 +156,7 @@ fn local_get(node: &TestNode, key: &[u8]) -> Option<Bytes> {
 #[tokio::test]
 async fn full_distributed_verifier_harness() {
     let _ = tracing_subscriber::fmt::try_init();
-    
+
     let n1 = start_node(1, free_addr()).await;
     let n2 = start_node(2, free_addr()).await;
     let n3 = start_node(3, free_addr()).await;
@@ -148,15 +166,26 @@ async fn full_distributed_verifier_harness() {
 
     // Test 1: Convergence
     println!("Testing write convergence...");
-    let leader_idx = find_leader_idx(&nodes).await.expect("no stable leader found");
+    let leader_idx = find_leader_idx(&nodes)
+        .await
+        .expect("no stable leader found");
     let leader = &nodes[leader_idx];
-    leader.node.write_put(b"stress".to_vec(), b"start".to_vec()).await.expect("stress write failed");
-    
+    leader
+        .node
+        .write_put(b"stress".to_vec(), b"start".to_vec())
+        .await
+        .expect("stress write failed");
+
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     for n in &nodes {
         let got = local_get(n, b"stress");
-        assert_eq!(got, Some(Bytes::from_static(b"start")), "Node {} diverged", n.id);
+        assert_eq!(
+            got,
+            Some(Bytes::from_static(b"start")),
+            "Node {} diverged",
+            n.id
+        );
     }
 
     // Test 2: Crash Failover
@@ -165,22 +194,31 @@ async fn full_distributed_verifier_harness() {
         .await
         .expect("shutdown timeout")
         .expect("shutdown failed");
-    
+
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let survivors: Vec<&TestNode> = nodes.iter().filter(|n| n.id != leader.id).collect();
     let mut wrote = false;
     for n in &survivors {
-        if n.node.write_put(b"failover".to_vec(), b"ok".to_vec()).await.is_ok() {
+        if n.node
+            .write_put(b"failover".to_vec(), b"ok".to_vec())
+            .await
+            .is_ok()
+        {
             wrote = true;
             break;
         }
     }
     assert!(wrote, "Failover election failed");
-    
+
     tokio::time::sleep(Duration::from_secs(2)).await;
     for n in &survivors {
         let got = local_get(n, b"failover");
-        assert_eq!(got, Some(Bytes::from_static(b"ok")), "Survivor Node {} diverged", n.id);
+        assert_eq!(
+            got,
+            Some(Bytes::from_static(b"ok")),
+            "Survivor Node {} diverged",
+            n.id
+        );
     }
 }

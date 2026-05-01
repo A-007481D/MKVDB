@@ -1,13 +1,29 @@
+use openraft::ServerState;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use openraft::ServerState;
 
 #[derive(Debug, Clone)]
 pub enum AdversarialEvent {
-    RpcSent { from: u64, to: u64, msg: String },
-    RpcReceived { from: u64, to: u64, msg: String, success: bool },
-    FaultInjected { from: u64, to: u64, rule: String },
-    NodeStateChanged { id: u64, state: ServerState },
+    RpcSent {
+        from: u64,
+        to: u64,
+        msg: String,
+    },
+    RpcReceived {
+        from: u64,
+        to: u64,
+        msg: String,
+        success: bool,
+    },
+    FaultInjected {
+        from: u64,
+        to: u64,
+        rule: String,
+    },
+    NodeStateChanged {
+        id: u64,
+        state: ServerState,
+    },
     TestInfo(String),
 }
 
@@ -27,10 +43,10 @@ impl EventLog {
     pub fn log(&self, event: AdversarialEvent) {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let mut events = self.events.lock().unwrap();
-        
+
         // Print to stderr for immediate feedback during tests
         eprintln!("[{:.3}s] {:?}", elapsed, event);
-        
+
         events.push((elapsed, event));
     }
 

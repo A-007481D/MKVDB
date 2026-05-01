@@ -1,15 +1,15 @@
-use std::sync::{Arc, RwLock};
-use std::collections::HashSet;
-use std::time::Duration;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub enum FaultRule {
     Partition(u64, u64),
     Delay(u64, u64, Duration),
     RandomDelay(u64, u64, Duration, Duration), // (src, dst, min, max)
-    Drop(u64, u64, f64), // (src, dst, probability)
-    Duplicate(u64, u64, f64), // (src, dst, probability)
+    Drop(u64, u64, f64),                       // (src, dst, probability)
+    Duplicate(u64, u64, f64),                  // (src, dst, probability)
 }
 
 pub struct FaultController {
@@ -84,7 +84,7 @@ impl FaultController {
         }
         action
     }
-    
+
     pub fn seed(&self) -> u64 {
         self.seed
     }

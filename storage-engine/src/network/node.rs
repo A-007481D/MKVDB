@@ -1,16 +1,16 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
-use openraft::{Raft, Config};
 use crate::engine::ApexEngine;
 use crate::iterator::ScanStream;
 use crate::network::grpc::{ApexRaftNetworkFactory, ApexRaftServer, ApexRaftTypeConfig};
 use crate::network::storage::ApexRaftStorage;
-use tonic::transport::Server;
 use anyhow::Result;
 use bytes::Bytes;
-use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
 use openraft::BasicNode;
+use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+use openraft::{Config, Raft};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::transport::Server;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub enum RaftCommand {
@@ -53,22 +53,18 @@ pub struct ApexNode {
 
 impl ApexNode {
     /// Starts the node with the default gRPC networking factory.
-    pub async fn start(
-        node_id: u64, 
-        bind_addr: &str, 
-        engine: Arc<ApexEngine>,
-    ) -> Result<Self> {
+    pub async fn start(node_id: u64, bind_addr: &str, engine: Arc<ApexEngine>) -> Result<Self> {
         Self::start_with_network(node_id, bind_addr, engine, ApexRaftNetworkFactory {}).await
     }
 
     /// Starts the node with a custom networking factory.
     pub async fn start_with_network<N>(
-        node_id: u64, 
-        bind_addr: &str, 
+        node_id: u64,
+        bind_addr: &str,
         engine: Arc<ApexEngine>,
         network_factory: N,
-    ) -> Result<Self> 
-    where 
+    ) -> Result<Self>
+    where
         N: openraft::network::RaftNetworkFactory<ApexRaftTypeConfig> + Send + Sync + 'static,
         N::Network: openraft::network::RaftNetwork<ApexRaftTypeConfig> + Send + Sync + 'static,
     {
@@ -85,7 +81,7 @@ impl ApexNode {
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
             ..Default::default()
         };
-        
+
         let raft = Raft::new(
             node_id,
             Arc::new(config),
@@ -108,8 +104,11 @@ impl ApexNode {
             tracing::info!("Starting Raft gRPC server on {}", addr);
             if let Err(e) = Server::builder()
                 .add_service(grpc_service)
-                .serve_with_shutdown(addr, async { shutdown_rx.await.ok(); })
-                .await {
+                .serve_with_shutdown(addr, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+            {
                 tracing::error!("Raft gRPC server error: {}", e);
             }
         });
@@ -125,7 +124,10 @@ impl ApexNode {
         }
 
         if retry == 20 {
-            return Err(anyhow::anyhow!("Raft server failed to bind on {} after 1s", addr));
+            return Err(anyhow::anyhow!(
+                "Raft server failed to bind on {} after 1s",
+                addr
+            ));
         }
 
         Ok(Self {
@@ -151,7 +153,7 @@ impl ApexNode {
     }
 
     /// Awaits until the cluster is fully stabilized and ready for configuration changes.
-    /// 
+    ///
     /// This is the "Raft Stabilization Barrier" required to prevent panics during
     /// membership changes. It guarantees:
     /// 1. A stable leader is elected.
@@ -160,25 +162,35 @@ impl ApexNode {
     /// 4. A quorum is actively reachable (confirmed via linearizability check).
     pub async fn await_cluster_stable(&self, timeout: Duration) -> Result<()> {
         tracing::info!("Node {}: Starting stabilization sequence...", self.node_id);
-        
+
         // 1. Wait for stable leader, committed vote, and applied index >= 1.
         self.raft
             .wait(Some(timeout))
-            .metrics(|m| {
-                let is_stable = m.current_leader.is_some() && 
-                                m.last_applied.map_or(0, |id| id.index) >= 1 &&
-                                m.vote.committed;
-                if is_stable {
-                    tracing::info!("Node {}: Metrics stability reached. Vote: {:?}, Applied: {:?}", 
-                        m.id, m.vote, m.last_applied);
-                }
-                is_stable
-            }, "wait for committed leadership")
+            .metrics(
+                |m| {
+                    let is_stable = m.current_leader.is_some()
+                        && m.last_applied.map_or(0, |id| id.index) >= 1
+                        && m.vote.committed;
+                    if is_stable {
+                        tracing::info!(
+                            "Node {}: Metrics stability reached. Vote: {:?}, Applied: {:?}",
+                            m.id,
+                            m.vote,
+                            m.last_applied
+                        );
+                    }
+                    is_stable
+                },
+                "wait for committed leadership",
+            )
             .await?;
 
         // 2. Perform a linearizability check to force a quorum confirmation.
         self.raft.ensure_linearizable().await.map_err(|e| {
-            anyhow::anyhow!("Cluster stabilization failed: leader cannot confirm quorum: {:?}", e)
+            anyhow::anyhow!(
+                "Cluster stabilization failed: leader cannot confirm quorum: {:?}",
+                e
+            )
         })?;
 
         // 3. Sledgehammer Quiescence: Give the cluster 2 seconds to synchronize internal state.
@@ -186,9 +198,12 @@ impl ApexNode {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let final_metrics = self.raft.metrics().borrow().clone();
-        tracing::info!("Node {}: Stabilization complete. Final Vote Committed: {}", 
-            self.node_id, final_metrics.vote.committed);
-        
+        tracing::info!(
+            "Node {}: Stabilization complete. Final Vote Committed: {}",
+            self.node_id,
+            final_metrics.vote.committed
+        );
+
         Ok(())
     }
 
@@ -208,10 +223,12 @@ impl ApexNode {
     ) -> Result<openraft::raft::ClientWriteResponse<ApexRaftTypeConfig>> {
         // Enforce stabilization before the mutation
         self.await_cluster_stable(Duration::from_secs(10)).await?;
-        
+
         // Final sanity write to ensure the term is "sealed"
-        self.commit_noop_barrier().await.map_err(|e| anyhow::anyhow!("Barrier failed: {:?}", e))?;
-        
+        self.commit_noop_barrier()
+            .await
+            .map_err(|e| anyhow::anyhow!("Barrier failed: {:?}", e))?;
+
         Ok(self.raft.add_learner(node_id, node, blocking).await?)
     }
 
@@ -223,7 +240,7 @@ impl ApexNode {
     ) -> Result<openraft::raft::ClientWriteResponse<ApexRaftTypeConfig>> {
         // Enforce stabilization before the mutation
         self.await_cluster_stable(Duration::from_secs(10)).await?;
-        
+
         Ok(self.raft.change_membership(members, retain).await?)
     }
 
@@ -255,7 +272,10 @@ impl ApexNode {
     /// automatically — callers pass the user-facing key.
     pub async fn read(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, ReadError> {
         self.raft.ensure_linearizable().await.map_err(|e| {
-            if let RaftError::APIError(openraft::error::CheckIsLeaderError::ForwardToLeader(leader)) = e {
+            if let RaftError::APIError(openraft::error::CheckIsLeaderError::ForwardToLeader(
+                leader,
+            )) = e
+            {
                 ReadError::Redirect(Self::map_forwarded_leader(&leader))
             } else {
                 ReadError::Redirect(WriteRedirect::UnknownLeader)
@@ -266,9 +286,10 @@ impl ApexNode {
         data_key.extend_from_slice(b"data:");
         data_key.extend_from_slice(key);
 
-        let val = self.engine.get(&data_key).map_err(|e| {
-            ReadError::Storage(format!("{e:?}"))
-        })?;
+        let val = self
+            .engine
+            .get(&data_key)
+            .map_err(|e| ReadError::Storage(format!("{e:?}")))?;
         Ok(val.map(|b| b.to_vec()))
     }
 
@@ -283,7 +304,10 @@ impl ApexNode {
         end_key: &[u8],
     ) -> std::result::Result<ScanStream, ReadError> {
         self.raft.ensure_linearizable().await.map_err(|e| {
-            if let RaftError::APIError(openraft::error::CheckIsLeaderError::ForwardToLeader(leader)) = e {
+            if let RaftError::APIError(openraft::error::CheckIsLeaderError::ForwardToLeader(
+                leader,
+            )) = e
+            {
                 ReadError::Redirect(Self::map_forwarded_leader(&leader))
             } else {
                 ReadError::Redirect(WriteRedirect::UnknownLeader)
@@ -298,9 +322,8 @@ impl ApexNode {
         prefixed_end.extend_from_slice(b"data:");
         prefixed_end.extend_from_slice(end_key);
 
-        self.engine.scan(
-            Bytes::from(prefixed_start),
-            Bytes::from(prefixed_end),
-        ).map_err(|e| ReadError::Storage(format!("{e:?}")))
+        self.engine
+            .scan(Bytes::from(prefixed_start), Bytes::from(prefixed_end))
+            .map_err(|e| ReadError::Storage(format!("{e:?}")))
     }
 }

@@ -50,9 +50,8 @@ async fn leader_accepts_write_via_raft() {
     assert_eq!(got, Some(Bytes::from_static(b"phase1-val")));
 }
 
-
-    #[ignore = "Test bootstrap sequence needs await_config_change_ready barrier"]
-    #[tokio::test]
+#[ignore = "Test bootstrap sequence needs await_config_change_ready barrier"]
+#[tokio::test]
 async fn follower_returns_moved_on_write() {
     let leader_addr = free_addr();
     let follower_addr = free_addr();
@@ -72,9 +71,7 @@ async fn follower_returns_moved_on_write() {
         .expect("leader linearizable barrier");
     tokio::time::timeout(
         Duration::from_secs(5),
-        leader
-        .raft
-        .add_learner(
+        leader.raft.add_learner(
             2,
             BasicNode {
                 addr: follower_addr.clone(),
@@ -88,8 +85,8 @@ async fn follower_returns_moved_on_write() {
     tokio::time::timeout(
         Duration::from_secs(5),
         leader
-        .raft
-        .change_membership(BTreeSet::from([1_u64, 2_u64]), false),
+            .raft
+            .change_membership(BTreeSet::from([1_u64, 2_u64]), false),
     )
     .await
     .expect("change membership timed out")
@@ -102,9 +99,8 @@ async fn follower_returns_moved_on_write() {
     assert_eq!(res, Err(WriteRedirect::Leader(leader_addr)));
 }
 
-
-    #[ignore = "Test bootstrap sequence needs await_config_change_ready barrier"]
-    #[tokio::test]
+#[ignore = "Test bootstrap sequence needs await_config_change_ready barrier"]
+#[tokio::test]
 async fn writes_continue_after_leader_shutdown() {
     let addr1 = free_addr();
     let addr2 = free_addr();
@@ -116,11 +112,23 @@ async fn writes_continue_after_leader_shutdown() {
 
     bootstrap_single(&n1, 1, &addr1).await;
     n1.raft
-        .add_learner(2, BasicNode { addr: addr2.clone() }, true)
+        .add_learner(
+            2,
+            BasicNode {
+                addr: addr2.clone(),
+            },
+            true,
+        )
         .await
         .expect("add learner 2");
     n1.raft
-        .add_learner(3, BasicNode { addr: addr3.clone() }, true)
+        .add_learner(
+            3,
+            BasicNode {
+                addr: addr3.clone(),
+            },
+            true,
+        )
         .await
         .expect("add learner 3");
     n1.raft
@@ -132,8 +140,12 @@ async fn writes_continue_after_leader_shutdown() {
     n1.raft.shutdown().await.expect("shutdown leader");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let r2 = n2.write_put(b"post-failover".to_vec(), b"ok".to_vec()).await;
-    let r3 = n3.write_put(b"post-failover".to_vec(), b"ok".to_vec()).await;
+    let r2 = n2
+        .write_put(b"post-failover".to_vec(), b"ok".to_vec())
+        .await;
+    let r3 = n3
+        .write_put(b"post-failover".to_vec(), b"ok".to_vec())
+        .await;
     assert!(
         r2.is_ok() || r3.is_ok(),
         "one surviving node should accept write after failover; r2={r2:?} r3={r3:?}"
