@@ -124,7 +124,9 @@ impl ApexNode {
         }
 
         if retry == 20 {
-            return Err(anyhow::anyhow!("Raft server failed to bind on {addr} after 1s"));
+            return Err(anyhow::anyhow!(
+                "Raft server failed to bind on {addr} after 1s"
+            ));
         }
 
         Ok(Self {
