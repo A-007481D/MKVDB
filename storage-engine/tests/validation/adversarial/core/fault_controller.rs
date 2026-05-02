@@ -1,9 +1,9 @@
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum FaultRule {
     Partition(u64, u64),
     Delay(u64, u64, Duration),
@@ -60,14 +60,14 @@ impl FaultController {
                 FaultRule::RandomDelay(a, b, min, max) => {
                     if src == *a && dst == *b {
                         let mut rng = self.rng.lock().unwrap();
-                        let millis = rng.gen_range(min.as_millis()..max.as_millis());
+                        let millis = rng.random_range(min.as_millis()..max.as_millis());
                         action.delay = Some(Duration::from_millis(millis as u64));
                     }
                 }
                 FaultRule::Drop(a, b, p) => {
                     if src == *a && dst == *b {
                         let mut rng = self.rng.lock().unwrap();
-                        if rng.gen_bool(*p) {
+                        if rng.random_bool(*p) {
                             action.drop = true;
                         }
                     }
@@ -75,7 +75,7 @@ impl FaultController {
                 FaultRule::Duplicate(a, b, p) => {
                     if src == *a && dst == *b {
                         let mut rng = self.rng.lock().unwrap();
-                        if rng.gen_bool(*p) {
+                        if rng.random_bool(*p) {
                             action.duplicate = true;
                         }
                     }
@@ -85,6 +85,7 @@ impl FaultController {
         action
     }
 
+    #[allow(dead_code)]
     pub fn seed(&self) -> u64 {
         self.seed
     }

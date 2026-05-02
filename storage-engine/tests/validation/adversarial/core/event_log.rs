@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AdversarialEvent {
     RpcSent {
         from: u64,
@@ -50,6 +51,7 @@ impl EventLog {
         events.push((elapsed, event));
     }
 
+    #[allow(dead_code)]
     pub fn dump(&self) {
         let events = self.events.lock().unwrap();
         eprintln!("\n--- ADVERSARIAL EVENT LOG DUMP ---");
@@ -59,6 +61,7 @@ impl EventLog {
         eprintln!("--- END DUMP ---\n");
     }
 
+    #[allow(dead_code)]
     pub fn clear(&self) {
         let mut events = self.events.lock().unwrap();
         events.clear();

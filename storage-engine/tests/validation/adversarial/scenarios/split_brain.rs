@@ -6,7 +6,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn adversarial_split_brain_survival() -> Result<()> {
-    let mut harness = AdversarialHarness::new(3, 12345).await?;
+    let harness = AdversarialHarness::new(3, 12345).await?;
     harness.log.log(AdversarialEvent::TestInfo(
         "Starting Split Brain Survival Test".to_string(),
     ));

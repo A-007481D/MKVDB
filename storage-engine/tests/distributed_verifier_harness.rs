@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,7 +105,7 @@ async fn bootstrap_cluster(nodes: &[TestNode]) {
             .wait(Some(Duration::from_secs(10)))
             .metrics(
                 move |m| {
-                    m.replication.as_ref().map_or(false, |r| {
+                    m.replication.as_ref().is_some_and(|r| {
                         r.get(&node_id)
                             .and_then(|matched| matched.as_ref().map(|id| id.index >= 1))
                             .unwrap_or(false)

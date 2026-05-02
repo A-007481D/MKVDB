@@ -100,6 +100,7 @@ impl ClusterHarness {
 
     // --- Metrics ---
 
+    #[allow(dead_code)]
     pub fn get_leader(&self) -> Option<u64> {
         for (&id, live) in &self.live {
             let m = live.node.raft.metrics().borrow().clone();

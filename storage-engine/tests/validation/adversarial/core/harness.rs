@@ -19,7 +19,7 @@ impl AdversarialHarness {
         let log = EventLog::new();
         let faults = FaultController::new(seed);
 
-        let mut inner = ClusterHarness::new(n).await?;
+        let inner = ClusterHarness::new(n).await?;
 
         let mut harness = Self { inner, log, faults };
 
