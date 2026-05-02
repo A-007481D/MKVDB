@@ -1,7 +1,5 @@
-use std::sync::{Arc, RwLock};
-use std::collections::HashSet;
 use openraft::{
-    BasicNode, 
+    BasicNode,
     error::{NetworkError, RPCError, RaftError},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
@@ -9,7 +7,11 @@ use openraft::{
         InstallSnapshotResponse, VoteRequest, VoteResponse,
     },
 };
-use storage_engine::network::grpc::{ApexRaftNetworkFactory, ApexRaftNetworkConnection, ApexRaftTypeConfig};
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use storage_engine::network::grpc::{
+    ApexRaftNetworkConnection, ApexRaftNetworkFactory, ApexRaftTypeConfig,
+};
 
 /// Controlled network faults for the proxy.
 #[derive(Default)]
@@ -71,7 +73,10 @@ impl RaftNetwork<ApexRaftTypeConfig> for ProxyNetworkConnection {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.faults.is_partitioned(self.source, self.target) {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Network Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "Network Partitioned",
+            ))));
         }
         self.inner.append_entries(rpc, option).await
     }
@@ -80,9 +85,15 @@ impl RaftNetwork<ApexRaftTypeConfig> for ProxyNetworkConnection {
         &mut self,
         rpc: InstallSnapshotRequest<ApexRaftTypeConfig>,
         option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>> {
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
+    > {
         if self.faults.is_partitioned(self.source, self.target) {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Network Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "Network Partitioned",
+            ))));
         }
         self.inner.install_snapshot(rpc, option).await
     }
@@ -93,7 +104,10 @@ impl RaftNetwork<ApexRaftTypeConfig> for ProxyNetworkConnection {
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.faults.is_partitioned(self.source, self.target) {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Network Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "Network Partitioned",
+            ))));
         }
         self.inner.vote(rpc, option).await
     }

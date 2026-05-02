@@ -106,10 +106,7 @@ impl ApexServer {
         }
     }
 
-    async fn dispatch_command(
-        node: &Arc<ApexNode>,
-        args: &mut [RespValue],
-    ) -> RespValue {
+    async fn dispatch_command(node: &Arc<ApexNode>, args: &mut [RespValue]) -> RespValue {
         let cmd_name = match &args[0] {
             RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_uppercase(),
             _ => return RespValue::Error("ERR invalid command format".to_string()),

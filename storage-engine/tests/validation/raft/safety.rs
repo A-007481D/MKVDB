@@ -1,8 +1,8 @@
 use crate::validation::common::harness::ClusterHarness;
-use std::collections::BTreeMap;
-use std::time::Duration;
 use anyhow::Result;
 use openraft::{BasicNode, ServerState};
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// Bootstrap a single-leader cluster, then expand to 3 voters.
 async fn bootstrap_cluster(harness: &ClusterHarness) -> Result<u64> {
@@ -26,11 +26,17 @@ async fn bootstrap_cluster(harness: &ClusterHarness) -> Result<u64> {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     eprintln!("[bootstrap] Adding node 2 as learner at {}", addr2);
-    node1.raft.add_learner(2, BasicNode { addr: addr2 }, true).await?;
+    node1
+        .raft
+        .add_learner(2, BasicNode { addr: addr2 }, true)
+        .await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     eprintln!("[bootstrap] Adding node 3 as learner at {}", addr3);
-    node1.raft.add_learner(3, BasicNode { addr: addr3 }, true).await?;
+    node1
+        .raft
+        .add_learner(3, BasicNode { addr: addr3 }, true)
+        .await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     eprintln!("[bootstrap] Promoting to 3-voter cluster");
@@ -52,7 +58,10 @@ async fn election_safety() -> Result<()> {
     let mut harness = ClusterHarness::new(3).await?;
     eprintln!("[test] Harness created. Bootstrapping...");
     let initial_leader = bootstrap_cluster(&harness).await?;
-    eprintln!("[test] Bootstrap complete. Initial leader: {}", initial_leader);
+    eprintln!(
+        "[test] Bootstrap complete. Initial leader: {}",
+        initial_leader
+    );
 
     for cycle in 0..3 {
         let leader = harness.assert_single_leader()?;
@@ -62,7 +71,10 @@ async fn election_safety() -> Result<()> {
 
         eprintln!("[test] Cycle {}: waiting for new election...", cycle);
         let new_leader = harness.wait_for_leader(Duration::from_secs(15)).await?;
-        assert_ne!(new_leader, leader, "New leader must differ from killed node");
+        assert_ne!(
+            new_leader, leader,
+            "New leader must differ from killed node"
+        );
         eprintln!("[test] Cycle {}: new leader is {}", cycle, new_leader);
 
         harness.assert_single_leader()?;
@@ -72,7 +84,10 @@ async fn election_safety() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let final_leader = harness.assert_single_leader()?;
-        eprintln!("[test] Cycle {}: after restart, leader is {}", cycle, final_leader);
+        eprintln!(
+            "[test] Cycle {}: after restart, leader is {}",
+            cycle, final_leader
+        );
     }
 
     Ok(())
@@ -91,7 +106,7 @@ async fn election_safety() -> Result<()> {
 async fn commit_safety_under_failover() -> Result<()> {
     let mut harness = ClusterHarness::new(3).await?;
     let leader = bootstrap_cluster(&harness).await?;
-    
+
     let key = b"commit_test".to_vec();
     let val = b"v1".to_vec();
 
@@ -101,11 +116,16 @@ async fn commit_safety_under_failover() -> Result<()> {
     // Get the index of the write
     let metrics = harness.live[&leader].node.raft.metrics().borrow().clone();
     let commit_index = metrics.last_log_index.unwrap_or(0);
-    eprintln!("[test] Data written at index {}. Waiting for convergence...", commit_index);
+    eprintln!(
+        "[test] Data written at index {}. Waiting for convergence...",
+        commit_index
+    );
 
     // Wait for all nodes to apply the write
     for &id in harness.live.keys() {
-        harness.wait_for_applied(id, commit_index, Duration::from_secs(10)).await?;
+        harness
+            .wait_for_applied(id, commit_index, Duration::from_secs(10))
+            .await?;
     }
     eprintln!("[test] All nodes converged.");
 
@@ -120,12 +140,25 @@ async fn commit_safety_under_failover() -> Result<()> {
 
     // Verify data on new leader
     let read_val = harness.get(new_leader, &key).await?;
-    assert_eq!(read_val, Some(val.clone()), "New leader must have committed data");
+    assert_eq!(
+        read_val,
+        Some(val.clone()),
+        "New leader must have committed data"
+    );
 
     // Verify data on surviving follower
-    let survivor = harness.live.keys().cloned().find(|&id| id != new_leader).unwrap();
+    let survivor = harness
+        .live
+        .keys()
+        .cloned()
+        .find(|&id| id != new_leader)
+        .unwrap();
     let read_val_survivor = harness.get_stale(survivor, &key).await?;
-    assert_eq!(read_val_survivor, Some(val), "Surviving follower must have committed data on disk");
+    assert_eq!(
+        read_val_survivor,
+        Some(val),
+        "Surviving follower must have committed data on disk"
+    );
 
     eprintln!("[test] Commit safety verified.");
     Ok(())
@@ -153,10 +186,10 @@ async fn stale_leader_write_rejection() -> Result<()> {
     // Attempt write to partitioned leader
     let key = b"stale_test".to_vec();
     let val = b"v_stale".to_vec();
-    
+
     eprintln!("[test] Attempting write to partitioned leader 1 (should timeout/fail)...");
     let put_future = harness.put(1, key.clone(), val.clone());
-    
+
     // We expect this to NOT complete successfully within a short timeout
     match tokio::time::timeout(Duration::from_secs(3), put_future).await {
         Ok(Err(_)) => eprintln!("[test] Write correctly failed or is pending."),
@@ -166,7 +199,9 @@ async fn stale_leader_write_rejection() -> Result<()> {
 
     eprintln!("[test] Waiting for nodes 2 & 3 to elect a new leader...");
     // Nodes 2 & 3 are still connected to each other, so they should form a majority
-    let new_leader = harness.wait_for_new_leader(1, Duration::from_secs(15)).await?;
+    let new_leader = harness
+        .wait_for_new_leader(1, Duration::from_secs(15))
+        .await?;
     assert_ne!(new_leader, 1, "New leader must be node 2 or 3");
     eprintln!("[test] New leader elected: {}", new_leader);
 
@@ -175,22 +210,41 @@ async fn stale_leader_write_rejection() -> Result<()> {
 
     // Wait for node 1 to see the new leader and step down
     tokio::time::sleep(Duration::from_secs(5)).await;
-    
+
     let m1 = harness.live[&1].node.raft.metrics().borrow().clone();
-    assert_ne!(m1.state, ServerState::Leader, "Old leader must have stepped down");
-    eprintln!("[test] Old leader stepped down. Current state: {:?}", m1.state);
+    assert_ne!(
+        m1.state,
+        ServerState::Leader,
+        "Old leader must have stepped down"
+    );
+    eprintln!(
+        "[test] Old leader stepped down. Current state: {:?}",
+        m1.state
+    );
 
     // Verify that a write to the NEW leader works
     let key2 = b"new_leader_test".to_vec();
     let val2 = b"v2".to_vec();
     harness.put(new_leader, key2.clone(), val2.clone()).await?;
-    
+
     // Verify node 1 eventually gets the new data
-    let commit_index = harness.live[&new_leader].node.raft.metrics().borrow().last_log_index.unwrap();
-    harness.wait_for_applied(1, commit_index, Duration::from_secs(10)).await?;
-    
+    let commit_index = harness.live[&new_leader]
+        .node
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap();
+    harness
+        .wait_for_applied(1, commit_index, Duration::from_secs(10))
+        .await?;
+
     let read_val = harness.get_stale(1, &key2).await?;
-    assert_eq!(read_val, Some(val2), "Old leader must have replicated data from new leader");
+    assert_eq!(
+        read_val,
+        Some(val2),
+        "Old leader must have replicated data from new leader"
+    );
 
     eprintln!("[test] Stale leader rejection verified.");
     Ok(())
