@@ -156,9 +156,7 @@ impl RaftService for ApexRaftServer {
         let (success, conflict_log_id) = match resp {
             AppendEntriesResponse::Success => (true, None),
             AppendEntriesResponse::PartialSuccess(id) => (true, id),
-            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_) => {
-                (false, None)
-            }
+            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_) => (false, None),
         };
 
         let current_metrics = self.raft.metrics().borrow().clone();
