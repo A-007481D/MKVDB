@@ -45,8 +45,16 @@ impl EventLog {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let mut events = self.events.lock().unwrap();
 
-        // Print to stderr for immediate feedback during tests
-        eprintln!("[{:.3}s] {:?}", elapsed, event);
+        // Print to stderr for immediate feedback during tests (Filter out noisy RPCs unless verbose)
+        let is_rpc = matches!(
+            event,
+            AdversarialEvent::RpcSent { .. } | AdversarialEvent::RpcReceived { .. }
+        );
+        let verbose = std::env::var("ADVERSARIAL_VERBOSE").is_ok();
+
+        if !is_rpc || verbose {
+            eprintln!("[{:.3}s] {:?}", elapsed, event);
+        }
 
         events.push((elapsed, event));
     }

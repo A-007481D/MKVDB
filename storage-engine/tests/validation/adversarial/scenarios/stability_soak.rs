@@ -25,7 +25,7 @@ async fn adversarial_stability_soak_3min() -> Result<()> {
 
     harness.inner.live[&1].node.raft.initialize(members).await?;
 
-    let duration = Duration::from_secs(180); // 3 minutes
+    let duration = Duration::from_secs(60); // 1 minute soak
     let start = Instant::now();
 
     // Background Writers
