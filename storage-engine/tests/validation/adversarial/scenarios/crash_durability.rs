@@ -22,11 +22,13 @@ async fn adversarial_crash_after_ack_durability() -> Result<()> {
     }
 
     harness.inner.live[&1].node.raft.initialize(members).await?;
-    
-    for cycle in 0..10 { // Reduced to 10 for regular test run, can be increased for deep validation
-        harness.log.log(AdversarialEvent::TestInfo(
-            format!("--- Cycle {} ---", cycle),
-        ));
+
+    for cycle in 0..10 {
+        // Reduced to 10 for regular test run, can be increased for deep validation
+        harness.log.log(AdversarialEvent::TestInfo(format!(
+            "--- Cycle {} ---",
+            cycle
+        )));
 
         let leader_id = harness
             .inner
@@ -37,10 +39,14 @@ async fn adversarial_crash_after_ack_durability() -> Result<()> {
         let val = format!("durability_val_{}", cycle).into_bytes();
 
         // 1. Issue write and wait for ACK
-        harness.inner.put(leader_id, key.clone(), val.clone()).await?;
-        harness.log.log(AdversarialEvent::TestInfo(
-            format!("Write acknowledged for key_{}", cycle),
-        ));
+        harness
+            .inner
+            .put(leader_id, key.clone(), val.clone())
+            .await?;
+        harness.log.log(AdversarialEvent::TestInfo(format!(
+            "Write acknowledged for key_{}",
+            cycle
+        )));
 
         // 2. IMMEDIATELY kill all nodes (Simulate power failure)
         harness.log.log(AdversarialEvent::TestInfo(
@@ -63,16 +69,17 @@ async fn adversarial_crash_after_ack_durability() -> Result<()> {
             .inner
             .wait_for_leader(Duration::from_secs(10))
             .await?;
-        
+
         // Wait for convergence to ensure state machine is up to date
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let read_val = harness.inner.get_stale(new_leader, &key).await?;
         assert_eq!(
-            read_val, 
-            Some(val), 
-            "Data loss detected after crash in cycle {}. Key: {:?}", 
-            cycle, key
+            read_val,
+            Some(val),
+            "Data loss detected after crash in cycle {}. Key: {:?}",
+            cycle,
+            key
         );
     }
 
