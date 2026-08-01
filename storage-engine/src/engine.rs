@@ -912,10 +912,7 @@ impl ApexEngine {
 
         let mut merging_iter = MergingIterator::new(iterators)?;
 
-        // Seek to start_key (O(N) for now, should be O(log N) in future)
-        while merging_iter.is_valid() && merging_iter.key().as_ref() < start_key.as_ref() {
-            merging_iter.next()?;
-        }
+        merging_iter.seek(start_key.as_ref())?;
 
         Ok(ScanStream::new(version, merging_iter, end_key))
     }
