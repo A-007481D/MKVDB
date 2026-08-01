@@ -5,7 +5,7 @@ use storage_engine::network::{ApexNode, ApexServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+
     tracing_subscriber::fmt::init();
 
     tracing::info!("Starting MKVDB Nitro (High-Performance Engine)...");
@@ -21,7 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all(data_dir)?;
 
-    // Initialize the engine with "Nitro" Group Commit enabled
     let config =
         ApexConfig::default().with_sync_policy(SyncPolicy::Delayed(Duration::from_millis(10)));
 
@@ -42,11 +41,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "127.0.0.1:50051"
     };
 
-    // Initialize the Raft node and the client server.
     let node = Arc::new(ApexNode::start(node_id, raft_bind_addr, Arc::clone(&engine)).await?);
-    let server = ApexServer::new(Arc::clone(&engine), node);
+    let server = ApexServer::new(Arc::clone(&engine), node.clone());
 
-    // Setup graceful shutdown channel
+
+    // We will check first if we need to bootstrap a new cluster !
+
+    if args.iter().any(|a| a == "--bootstrap") {
+
+        use openraft::BasicNode;
+
+        use std::collections::BTreeMap;
+
+        tracing::info!("Bootstrapping new cluster..");
+
+        let mut members = BTreeMap::new();
+
+        members.insert(node_id, BasicNode {addr : raft_bind_addr.to_string()});
+
+
+        // we force the cluser to elect this node (itself and grant it rights to vote)
+        match node.raft.initialize(members).await {
+
+            Ok(_) => tracing::info!("Cluster bootstrap successful"),
+            Err(e) =>  tracing::warn!("Cluster bootstrap failed (already initialized ?). {:?}", e),
+        }
+
+
+    }
+
+
+
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
@@ -57,7 +82,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tx.send(());
     });
 
-    // Listen on standard Redis port
     server.run("127.0.0.1:6379", rx).await?;
 
     tracing::info!("MKVDB shutdown complete. Stay safe!");
