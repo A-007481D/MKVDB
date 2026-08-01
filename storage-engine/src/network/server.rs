@@ -167,6 +167,57 @@ impl ApexServer {
                     Err(redirect) => Self::moved_error(redirect),
                 }
             }
+            "CLUSTER" => {
+                if args.len() < 4 {
+                    return RespValue::Error("ERR usage: CLUSTER JOIN <node_id> <address>".to_string());
+                }
+                
+                let sub_cmd = match &args[1] {
+                    RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_uppercase(),
+                    _ => return RespValue::Error("ERR invalid subcommand".to_string()),
+                };
+
+                if sub_cmd == "JOIN" {
+                    let new_node_id = match &args[2] {
+                        RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0),
+                        _ => 0,
+                    };
+                    let new_node_addr = match &args[3] {
+                        RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_string(),
+                        _ => return RespValue::Error("ERR invalid address".to_string()),
+                    };
+
+                    if new_node_id == 0 {
+                        return RespValue::Error("ERR invalid node id".to_string());
+                    }
+
+                    tracing::info!("Adding node {} at {} to the cluster", new_node_id, new_node_addr);
+
+                    use openraft::BasicNode;
+                    let node_config = BasicNode { addr: new_node_addr };
+
+                    // Step 1: Add the node as a Learner so it syncs the database
+                    if let Err(e) = node.raft.add_learner(new_node_id, node_config, true).await {
+                        return RespValue::Error(format!("ERR failed to add learner: {:?}", e));
+                    }
+
+                    // Step 2: Get the current voters and add the new node to the list
+                    let metrics = node.raft.metrics().borrow().clone();
+                    let mut current_voters: Vec<u64> = metrics.membership_config.voter_ids().collect();
+                    if !current_voters.contains(&new_node_id) {
+                        current_voters.push(new_node_id);
+                    }
+
+                    // Step 3: Upgrade the Learner to a Voter
+                    if let Err(e) = node.raft.change_membership(current_voters, true).await {
+                        return RespValue::Error(format!("ERR failed to change membership: {:?}", e));
+                    }
+
+                    RespValue::SimpleString("OK".to_string())
+                } else {
+                    RespValue::Error("ERR unknown CLUSTER subcommand".to_string())
+                }
+            }
             "SCAN" => {
                 // Usage: SCAN start_key end_key
                 if args.len() != 3 {
